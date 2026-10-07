@@ -89,7 +89,9 @@ The local launcher uses a separately managed official SDK and a private profile;
 see [local runtime](local-runtime.md) and [shared Pi runtime](shared-pi-runtime.md).
 A new machine needs its own documented SDK/profile provisioning. Remote CI must
 supply the declared optional Pi SDK peer packages; success with a local managed
-SDK does not establish fresh-clone CI or turnkey installation.
+SDK does not establish fresh-clone CI or turnkey installation. The fork's CI
+workflow explicitly installs the qualified 1.0.3 SDK peers without changing the
+lockfile; its hosted result still needs to be observed independently.
 
 Do not run the inherited `npm run release` to publish `@agegr/pi-web` as our fork.
 Renaming packages, configuring releases or deploying GitHub Pages is a separate
@@ -112,3 +114,12 @@ locale behavior. The two new upstream write-display tests passed there too.
 This bootstrap does not repair that independent locale/test-contract mismatch,
 claim full-suite CI acceptance, or restart the service. Private raw checks remain
 under `.local/tmp/fork-bootstrap/`.
+
+## Subsequent local feature publication (2026-10-07)
+
+The separate [feature qualification record](fork-publication-qualification.md)
+accepts the retained subagent, usage/TPS, diagnostics, runtime-update and UI work
+with bounded repairs. It records 2406 passing standalone tests, separate static,
+demo and native integration checks, and the remaining hosted/runtime limits.
+This later acceptance supersedes the bootstrap's unqualified working-copy status;
+it does not rewrite the initial publication evidence or authorize deployment.
