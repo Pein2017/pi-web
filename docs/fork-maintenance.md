@@ -24,6 +24,9 @@ relabelled or retroactively moved by this bootstrap.
 This checkout uses `origin` for the fork and `upstream` for the original author.
 The upstream push URL is deliberately unusable and the default push remote is
 `origin`. These are local Git settings, not settings inherited by another clone.
+The installed GitHub CLI does not support `gh repo set-default`; name the fork
+explicitly for GitHub operations (for example, `gh pr create --repo Pein2017/pi-web
+--base main`) instead of relying on implicit fork/upstream repository selection.
 For a new clone:
 
 ```bash
