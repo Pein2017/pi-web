@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import type { BranchPreview, SessionEntry, SessionTreeNode } from "@/lib/types";
+import { OBSERVED_DECODE_TPS_ENTRY_TYPE } from "../../lib/session-decode-tps";
 import { useI18n } from "@/hooks/useI18n";
 
 interface Props {
@@ -49,6 +50,14 @@ function isMessageEntry(entry: SessionEntry): boolean {
   return entry.type === "message" && "message" in entry && entry.message.role !== "system";
 }
 
+function isObservedDecodeTpsEntry(entry: SessionEntry): boolean {
+  return entry.type === "custom" && entry.customType === OBSERVED_DECODE_TPS_ENTRY_TYPE;
+}
+
+function compressedVisibleEntryCount(node: SessionTreeNode): number {
+  return Math.max(0, (node.compressedEntryIds?.length ?? 0) - (node.compressedTransparentEntryIds?.length ?? 0));
+}
+
 // Compress a visible linear chain into the first branching/leaf node.
 // Server-side compressed IDs also count as skipped nodes.
 // branchPreview is the bounded preview of the first message on the source
@@ -62,12 +71,12 @@ export function compressChain(node: SessionTreeNode): {
   let current = node;
   let branchPreview = current.branchPreview;
   let labelEntry: SessionEntry | null = isMessageEntry(current.entry) ? current.entry : null;
-  let skipped = current.compressedEntryIds?.length ?? 0;
+  let skipped = compressedVisibleEntryCount(current);
   while (current.children.length === 1) {
     current = current.children[0];
     branchPreview ??= current.branchPreview;
     if (!labelEntry && isMessageEntry(current.entry)) labelEntry = current.entry;
-    skipped += 1 + (current.compressedEntryIds?.length ?? 0);
+    skipped += (isObservedDecodeTpsEntry(current.entry) ? 0 : 1) + compressedVisibleEntryCount(current);
   }
   return { node: current, skipped, branchPreview, labelEntry: labelEntry ?? current.entry };
 }

@@ -43,6 +43,13 @@ test("treats global and project profiles as directly editable", () => {
   assert.match(source, /selected && isWritableScope\(selected\.scope\) && mode === "edit"/);
 });
 
+test("editing and duplicating profiles retain shared-runtime metadata", () => {
+  const copy = source.match(/function editableProfile\([\s\S]*?\n\}/)?.[0] ?? "";
+  for (const key of ["color", "isolation", "persistSession"]) {
+    assert.match(copy, new RegExp(`\\b${key}: profile\\.${key}\\b`), key);
+  }
+});
+
 test("offers both writable scopes when creating a profile", () => {
   // In the header, where a saved profile shows its scope tag.
   assert.match(source, /\{creating \? \(\s*<ConfigSaveTarget\s+value=\{targetScope\}/);
@@ -57,7 +64,7 @@ test("uses the shared sidebar action for new profiles", () => {
 });
 
 test("sends the selected scope for saves and the source scope for deletes", () => {
-  assert.match(source, /JSON\.stringify\(\{ cwd, scope: targetScope, profile: draft \}\)/);
+  assert.match(source, /JSON\.stringify\(\{ cwd, scope: targetScope, profile: normalizeAgentResourceDraft\(draft\) \}\)/);
   assert.match(source, /JSON\.stringify\(\{ cwd, scope: selected\.scope, name: selected\.name \}\)/);
 });
 

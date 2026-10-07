@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { homedir } from "os";
 import type { IPty } from "node-pty";
 import { samePath } from "./paths";
+import { assertSharedPiWorkAdmission } from "./shared-pi-update.cjs";
 
 export type TerminalEvent =
   | { type: "output"; data: string; offset: number; reset?: boolean }
@@ -72,6 +73,7 @@ function dimension(value: number, fallback: number): number {
 }
 
 export function createTerminal(cwd: string, cols: number, rows: number, id: string = randomUUID()): string {
+  assertSharedPiWorkAdmission();
   const existing = registry().get(id);
   if (existing) {
     if (!samePath(existing.cwd, cwd)) throw new Error("Terminal belongs to a different workspace");
@@ -135,6 +137,10 @@ export function createTerminal(cwd: string, cols: number, rows: number, id: stri
 
 export function hasTerminal(id: string): boolean {
   return registry().has(id);
+}
+
+export function hasOpenTerminalShells(): boolean {
+  return [...(globalThis.__piWebTerminals?.values() ?? [])].some((record) => !record.exited);
 }
 
 export function getTerminalCwd(id: string): string | undefined {

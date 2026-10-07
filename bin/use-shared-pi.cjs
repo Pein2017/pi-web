@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* eslint-disable @typescript-eslint/no-require-imports -- Native CommonJS launcher. */
 // Bind this local Web checkout to the official managed Pi selected by its CLI.
 const fs = require('node:fs');
 const path = require('node:path');
@@ -8,10 +9,13 @@ const agentRoot = process.env.PI_CODING_AGENT_DIR;
 if (!agentRoot || !path.isAbsolute(agentRoot)) {
   throw new Error('Set PI_CODING_AGENT_DIR to the shared Pi profile before starting Web.');
 }
-const installRoot = path.join(agentRoot, 'install');
+const installRoot = process.env.PI_MANAGED_INSTALL_ROOT;
+if (!installRoot || !path.isAbsolute(installRoot)) {
+  throw new Error('Set PI_MANAGED_INSTALL_ROOT to the canonical managed Pi installation.');
+}
 const marker = JSON.parse(fs.readFileSync(path.join(installRoot, 'managed-install.json'), 'utf8'));
 if (marker.kind !== 'pi-managed-install' || marker.schemaVersion !== 1 || marker.layout !== 'releases-v1') {
-  throw new Error('The shared Pi profile does not contain an official managed installation.');
+  throw new Error('The selected installation is not an official managed Pi installation.');
 }
 const version = fs.readFileSync(path.join(installRoot, 'current-version'), 'utf8').trim();
 if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
@@ -32,7 +36,7 @@ if (!['--check', '--activate'].includes(mode) || process.argv.length > 3) {
 if (mode === '--activate') {
   const destination = path.join(webRoot, 'node_modules', '@earendil-works');
   const existing = fs.lstatSync(destination, { throwIfNoEntry: false });
-  if (!existing || fs.realpathSync(destination) !== fs.realpathSync(scope)) {
+  if (!existing || !fs.existsSync(destination) || fs.realpathSync(destination) !== fs.realpathSync(scope)) {
     const recovery = path.join(webRoot, '.local', 'recovery', 'shared-pi-runtime');
     fs.mkdirSync(recovery, { recursive: true, mode: 0o700 });
     const stamp = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`;
@@ -47,12 +51,14 @@ if (mode === '--activate') {
         receipt.previous = fs.readlinkSync(destination);
       }
       try {
+        // Write recovery metadata before the commit point; a full disk must not
+        // report failure after the SDK binding already changed.
+        fs.writeFileSync(path.join(recovery, `${stamp}.json`), `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
         fs.renameSync(temporary, destination);
       } catch (error) {
         if (receipt.backup) fs.renameSync(receipt.backup, destination);
         throw error;
       }
-      fs.writeFileSync(path.join(recovery, `${stamp}.json`), `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
     } finally {
       if (fs.lstatSync(temporary, { throwIfNoEntry: false })) fs.unlinkSync(temporary);
     }

@@ -7,6 +7,8 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as PiAgentMessage } from "@earendil-works/pi-agent-core";
+import type { ObservedDecodeTpsSummary } from "./session-decode-tps";
+import type { SessionUsageBreakdown } from "./session-usage-breakdown";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 
 export interface ContextUsage {
@@ -53,9 +55,11 @@ export interface SessionStatsInfo {
     total: number;
   };
   cost: number;
+  usageBreakdown: SessionUsageBreakdown;
   contextUsage?: ContextUsage;
   /** Estimated active time across all entries in the session file. */
   totalActiveMs?: number;
+  observedDecodeTps?: ObservedDecodeTpsSummary;
 }
 
 interface PromptTemplateLike {
@@ -129,6 +133,7 @@ export interface AgentSessionLike {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
   readonly isStreaming: boolean;
+  readonly isIdle?: boolean;
   readonly isCompacting: boolean;
   readonly autoCompactionEnabled: boolean;
   readonly autoRetryEnabled: boolean;
@@ -193,7 +198,7 @@ export interface AgentSessionLike {
   setThinkingLevel(level: string): void;
   compact(customInstructions?: string): Promise<unknown>;
   setSessionName(name: string): void;
-  getSessionStats(): Omit<SessionStatsInfo, "sessionName">;
+  getSessionStats(): Omit<SessionStatsInfo, "sessionName" | "usageBreakdown">;
   getLastAssistantText(): string | undefined;
   setAutoCompactionEnabled(enabled: boolean): void;
   setAutoRetryEnabled(enabled: boolean): void;

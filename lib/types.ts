@@ -346,6 +346,7 @@ export interface SessionTreeNode {
   children: SessionTreeNode[];
   label?: string;
   compressedEntryIds?: string[];
+  compressedTransparentEntryIds?: string[];
   branchPreview?: BranchPreview;
 }
 

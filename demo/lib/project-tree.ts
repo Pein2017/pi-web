@@ -1,4 +1,5 @@
 import type { BranchPreview } from "@/lib/types";
+import { OBSERVED_DECODE_TPS_ENTRY_TYPE } from "../../lib/session-decode-tps";
 
 // BranchNavigator still traverses recursively, so keep the response tree shallow.
 export const MAX_PROJECTED_TREE_DEPTH = 200;
@@ -7,6 +8,7 @@ const MAX_BRANCH_PREVIEW_LENGTH = 40;
 type ProjectableEntry = {
   id: string;
   type: string;
+  customType?: string;
   message?: unknown;
 };
 
@@ -17,17 +19,20 @@ export interface SummaryTreeNode {
     parentId: string | null;
     type: string;
     timestamp: string;
+    customType?: string;
   };
   children: SummaryTreeNode[];
   compressedEntryIds?: string[];
+  compressedTransparentEntryIds?: string[];
   branchPreview?: BranchPreview;
 }
 
 /** Loose input shape: accepts the SDK tree as well as the projected tree. */
 interface SummaryInputNode {
-  entry: { id: string; type: string; parentId?: string | null; timestamp?: string };
+  entry: { id: string; type: string; parentId?: string | null; timestamp?: string; customType?: string };
   children: SummaryInputNode[];
   compressedEntryIds?: string[];
+  compressedTransparentEntryIds?: string[];
   branchPreview?: BranchPreview;
 }
 
@@ -57,9 +62,15 @@ export function toSummaryTree(nodes: readonly SummaryInputNode[]): SummaryTreeNo
         parentId: input.entry.parentId ?? null,
         type: input.entry.type,
         timestamp: input.entry.timestamp ?? "",
+        ...(input.entry.type === "custom" && input.entry.customType === OBSERVED_DECODE_TPS_ENTRY_TYPE
+          ? { customType: input.entry.customType }
+          : {}),
       },
       children: [],
       ...(input.compressedEntryIds?.length ? { compressedEntryIds: input.compressedEntryIds } : {}),
+      ...(input.compressedTransparentEntryIds?.length
+        ? { compressedTransparentEntryIds: input.compressedTransparentEntryIds }
+        : {}),
       ...(input.branchPreview ? { branchPreview: input.branchPreview } : {}),
     };
     (frame as { into?: SummaryTreeNode[] }).into!.push(summary);
@@ -74,11 +85,16 @@ type ProjectableTreeNode<T> = {
   entry: ProjectableEntry;
   children: T[];
   compressedEntryIds?: string[];
+  compressedTransparentEntryIds?: string[];
   branchPreview?: BranchPreview;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isObservedDecodeTpsEntry(entry: ProjectableEntry): boolean {
+  return entry.type === "custom" && entry.customType === OBSERVED_DECODE_TPS_ENTRY_TYPE;
 }
 
 function appendPreviewText(current: string, value: unknown): string {
@@ -162,10 +178,16 @@ export function projectTreeForResponse<T extends ProjectableTreeNode<T>>(
     }
   }
 
-  const cloneNode = (node: T, compressedEntryIds?: string[], branchPreview?: BranchPreview): T => ({
+  const cloneNode = (
+    node: T,
+    compressedEntryIds?: string[],
+    branchPreview?: BranchPreview,
+    compressedTransparentEntryIds?: string[],
+  ): T => ({
     ...node,
     children: [],
     ...(compressedEntryIds?.length ? { compressedEntryIds } : {}),
+    ...(compressedTransparentEntryIds?.length ? { compressedTransparentEntryIds } : {}),
     ...(branchPreview ? { branchPreview } : {}),
   });
   const projectedRoots = nodes.map((node) => cloneNode(node, undefined, previewForEntry(node.entry)));
@@ -179,26 +201,30 @@ export function projectTreeForResponse<T extends ProjectableTreeNode<T>>(
     const pending = [{
       node: source,
       compressedEntryIds: [] as string[],
+      compressedTransparentEntryIds: [] as string[],
       branchPreview: undefined as BranchPreview | undefined,
     }];
     const flattenedSeen = new Set<T>();
 
     while (pending.length > 0) {
-      const { node, compressedEntryIds, branchPreview } = pending.pop()!;
+      const { node, compressedEntryIds, compressedTransparentEntryIds, branchPreview } = pending.pop()!;
       if (flattenedSeen.has(node)) continue;
       flattenedSeen.add(node);
       const nextPreview = branchPreview ?? previewForEntry(node.entry);
 
       if (keep.has(node)) {
-        projectedParent.children.push(cloneNode(node, compressedEntryIds, nextPreview));
+        projectedParent.children.push(cloneNode(node, compressedEntryIds, nextPreview, compressedTransparentEntryIds));
       }
 
       for (let i = node.children.length - 1; i >= 0; i--) {
         pending.push({
           node: node.children[i],
-          compressedEntryIds: keep.has(node)
+          compressedEntryIds: keep.has(node) ? [] : [...compressedEntryIds, node.entry.id],
+          compressedTransparentEntryIds: keep.has(node)
             ? []
-            : [...compressedEntryIds, node.entry.id],
+            : isObservedDecodeTpsEntry(node.entry)
+              ? [...compressedTransparentEntryIds, node.entry.id]
+              : compressedTransparentEntryIds,
           branchPreview: keep.has(node) ? undefined : nextPreview,
         });
       }
@@ -217,9 +243,11 @@ export function projectTreeForResponse<T extends ProjectableTreeNode<T>>(
       }
 
       const compressedEntryIds: string[] = [];
+      const compressedTransparentEntryIds: string[] = [];
       let branchPreview = previewForEntry(child.entry);
       while (!keep.has(child) && child.children.length === 1) {
         compressedEntryIds.push(child.entry.id);
+        if (isObservedDecodeTpsEntry(child.entry)) compressedTransparentEntryIds.push(child.entry.id);
         child = child.children[0];
         branchPreview ??= previewForEntry(child.entry);
       }
@@ -228,7 +256,7 @@ export function projectTreeForResponse<T extends ProjectableTreeNode<T>>(
         continue;
       }
 
-      const projectedChild = cloneNode(child, compressedEntryIds, branchPreview);
+      const projectedChild = cloneNode(child, compressedEntryIds, branchPreview, compressedTransparentEntryIds);
       projected.children.push(projectedChild);
       tasks.push({ source: child, projected: projectedChild, depth: depth + 1 });
     }

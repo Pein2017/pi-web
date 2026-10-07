@@ -17,7 +17,7 @@ try {
 const gfmAutolinkEmailLoader = join(configDir, "lib/gfm-autolink-email-loader.cjs");
 
 const nextConfig: NextConfig = {
-  outputFileTracingRoot: configDir,
+  outputFileTracingRoot: join(configDir, "../.."),
   experimental: {
     // proxy.ts matches /api/:path*, and Next buffers the request body whenever
     // a proxy is present, capped at 10 MB by default. The upload route accepts
@@ -30,6 +30,9 @@ const nextConfig: NextConfig = {
   images: { unoptimized: true },
   // `next dev` runs Turbopack and `npm run build` runs webpack.
   turbopack: {
+    // The managed Pi SDK lives in codex-tools/pi-core/.local/install.
+    // Keep the common resolver root for the SDK link and local extensions.
+    root: join(configDir, "../.."),
     rules: {
       "**/mdast-util-gfm-autolink-literal/lib/index.js": { loaders: [gfmAutolinkEmailLoader] },
     },
@@ -53,11 +56,13 @@ const nextConfig: NextConfig = {
     "@earendil-works/pi-ai",
     "@earendil-works/pi-tui",
   ],
-  // Next 16 blocks cross-origin access to dev resources by default. Allow the
-  // loopback and the RFC1918 LAN ranges so the dev server stays reachable
-  // from other machines on the same LAN.
+  // Next 16 blocks cross-origin access to dev resources by default. The
+  // Cloudflare Access login host becomes the Referer for proxied script loads;
+  // allow it and the public app host used by the tunneled browser.
   allowedDevOrigins: [
     "127.0.0.1",
+    "agegr.pein17.com",
+    "pein17.cloudflareaccess.com",
     "10.*.*.*",
     // 172.16.0.0/12
     "172.16.*.*",

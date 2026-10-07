@@ -1,7 +1,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dump as stringifyYaml } from "js-yaml";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync } from "fs";
 import { basename, dirname, join, resolve } from "path";
 import { parseFrontmatter } from "./frontmatter";
 import { parseNpmSource } from "./npm-source";
@@ -10,6 +10,7 @@ import { isExistingPathWithinRoots } from "./path-security";
 import { disabledBuiltInSubagents } from "./subagent-settings";
 import { PRESET_READ_ONLY } from "./tool-presets";
 import type { SessionEntry, SubagentSessionStatus } from "./types";
+import { aliasSelectors, validateResourceSelection, validateResourceSelectors, type SubagentResourceSelection } from "./subagent-resource-selection";
 
 export const SUBAGENT_META_TYPE = "pi-web:subagent";
 export const SUBAGENT_STATUS_TYPE = "pi-web:subagent-status";
@@ -20,7 +21,7 @@ export type SubagentStatus = SubagentSessionStatus;
 export type SubagentScope = "builtin" | "global" | "workspace" | "project";
 export type SubagentWritableScope = Extract<SubagentScope, "global" | "project">;
 
-export interface SubagentProfile {
+export interface SubagentProfile extends SubagentResourceSelection {
   name: string;
   displayName: string;
   description: string;
@@ -60,7 +61,7 @@ export interface SubagentMetadata {
   worktreeBranch?: string;
 }
 
-export interface SubagentResourceSnapshot {
+export interface SubagentResourceSnapshot extends SubagentResourceSelection {
   version: 1;
   appendSystemPrompt: string[];
   tools: string[];
@@ -69,12 +70,19 @@ export interface SubagentResourceSnapshot {
   exactSystemPrompt?: string;
 }
 
-export interface SubagentSessionResources {
+export interface SubagentSessionResources extends SubagentResourceSelection {
   appendSystemPrompt: string[];
   tools: string[];
   loadSkills: boolean;
   loadExtensions: boolean;
   exactSystemPrompt?: string;
+}
+
+export interface SubagentTelemetry {
+  /** Exact observed SDK turn_end events for this start/resume invocation, not assistant responses. */
+  turnCount: number;
+  turnCountBasis: "turn_end";
+  terminationReason: "completed" | "abort-requested" | "max-turns" | "provider-error" | "runtime-error";
 }
 
 export interface SubagentResultMetadata {
@@ -84,6 +92,7 @@ export interface SubagentResultMetadata {
   result?: string;
   error?: string;
   worktreeCleanupError?: string;
+  telemetry?: SubagentTelemetry;
 }
 
 export interface SubagentStatusMetadata {
@@ -108,6 +117,7 @@ export interface SubagentRunInfo {
   worktreePath?: string;
   worktreeBranch?: string;
   worktreeCleanupError?: string;
+  telemetry?: SubagentTelemetry;
   /** Set on a run started by `resume`, which reuses the session ID of an earlier run. Not persisted. */
   resumed?: boolean;
 }
@@ -130,6 +140,8 @@ const MANAGED_FRONTMATTER_KEYS = new Set([
   "tools",
   "load_skills",
   "load_extensions",
+  "mcp_servers",
+  "mcp_tools",
   "enabled",
   "inherit_context",
   "run_in_background",
@@ -206,6 +218,7 @@ function booleanValue(value: unknown, fallback: boolean): boolean {
 
 function resourceBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") return value;
+  if (typeof value === "string" && ["false", "none"].includes(value.trim().toLowerCase())) return false;
   return Array.isArray(value) || typeof value === "string" ? true : fallback;
 }
 
@@ -314,6 +327,12 @@ function parseProfileFile(filePath: string, scope: SubagentScope): SubagentProfi
       tools: tools.filter((tool) => !disallowedTools.has(tool)),
       ...(extensionTools.length > 0 ? { extensionTools } : {}),
       ...(disallowedExtensionTools.length > 0 ? { disallowedExtensionTools } : {}),
+      ...validateResourceSelection({
+        skillNames: aliasSelectors(data?.skills, "skillNames"),
+        extensionPaths: aliasSelectors(data?.extensions, "extensionPaths"),
+        mcpServers: validateResourceSelectors(data?.mcp_servers, "mcpServers"),
+        mcpTools: validateResourceSelectors(data?.mcp_tools, "mcpTools"),
+      }),
       loadSkills: resourceBoolean(data?.load_skills ?? data?.skills, false),
       loadExtensions: resourceBoolean(data?.load_extensions ?? data?.extensions, extensionTools.length > 0),
       ...(stringValue(data?.model) ? { model: stringValue(data?.model) } : {}),
@@ -348,11 +367,21 @@ function readProfileDirectory(dir: string, scope: SubagentScope, cwd: string): S
 }
 
 function profileDirectories(cwd: string): Array<[string, Exclude<SubagentScope, "builtin">]> {
-  return [
+  const directories: Array<[string, Exclude<SubagentScope, "builtin">]> = [
     [join(getAgentDir(), "agents"), "global"],
     [join(resolve(cwd), ".agents", "agents"), "workspace"],
     [join(resolve(cwd), ".pi", "agents"), "project"],
   ];
+  // An agent directory may itself be cwd/.pi. One physical source has one owner;
+  // keep its first (global) identity without changing precedence for distinct dirs.
+  const seen = new Set<string>();
+  return directories.filter(([dir]) => {
+    let physicalPath = resolve(dir);
+    try { physicalPath = realpathSync(dir); } catch { /* missing directories are skipped when read */ }
+    if (seen.has(physicalPath)) return false;
+    seen.add(physicalPath);
+    return true;
+  });
 }
 
 /**
@@ -453,6 +482,13 @@ export function saveSubagentProfile(
   }
   const filePath = join(dir, `${name}.md`);
   const stored = readStoredFrontmatter(filePath);
+  // Old API clients that omit selector fields must not erase an authored whitelist.
+  const selection = validateResourceSelection({
+    skillNames: profile.skillNames !== undefined ? profile.skillNames : aliasSelectors(stored.skills, "skillNames"),
+    extensionPaths: profile.extensionPaths !== undefined ? profile.extensionPaths : aliasSelectors(stored.extensions, "extensionPaths"),
+    mcpServers: profile.mcpServers !== undefined ? profile.mcpServers : validateResourceSelectors(stored.mcp_servers, "mcpServers"),
+    mcpTools: profile.mcpTools !== undefined ? profile.mcpTools : validateResourceSelectors(stored.mcp_tools, "mcpTools"),
+  });
   const managed: Record<string, unknown> = {
     description,
     display_name: displayName,
@@ -466,6 +502,11 @@ export function saveSubagentProfile(
   };
   syncFlagAlias(managed, "skills", stored.skills, loadSkills);
   syncFlagAlias(managed, "extensions", stored.extensions, loadExtensions);
+  if (profile.skillNames !== undefined) managed.skills = selection.skillNames ?? loadSkills;
+  // Preserve foreign package-name aliases unless the caller explicitly edits paths.
+  if (profile.extensionPaths !== undefined || (selection.extensionPaths?.length ?? 0) > 0) managed.extensions = selection.extensionPaths ?? loadExtensions;
+  if (selection.mcpServers !== undefined) managed.mcp_servers = selection.mcpServers;
+  if (selection.mcpTools !== undefined) managed.mcp_tools = selection.mcpTools;
   if (model) managed.model = model;
   if (profile.thinking) managed.thinking = profile.thinking;
   if (maxTurns) managed.max_turns = maxTurns;
@@ -481,6 +522,10 @@ export function saveSubagentProfile(
   writePrivateFileAtomicSync(filePath, `---\n${yaml}\n---\n\n${systemPrompt}\n`);
   return {
     ...profile,
+    skillNames: selection.skillNames,
+    extensionPaths: selection.extensionPaths,
+    mcpServers: selection.mcpServers,
+    mcpTools: selection.mcpTools,
     name,
     displayName,
     description,
@@ -551,7 +596,7 @@ export function readSubagentSessionResources(
       typeof item === "string"
       && item.length > 0
       && !SUBAGENT_CONTROL_TOOLS.has(item)
-      && (BUILTIN_TOOLS.has(item) || loadExtensions)
+      && (BUILTIN_TOOLS.has(item) || loadExtensions || (Array.isArray(snapshot.mcpServers) && snapshot.mcpServers.length > 0))
     )
   ) {
     return {
@@ -559,6 +604,7 @@ export function readSubagentSessionResources(
       tools: [...new Set(snapshot.tools)],
       loadSkills,
       loadExtensions,
+      ...validateResourceSelection(snapshot),
       ...(typeof snapshot.exactSystemPrompt === "string" ? { exactSystemPrompt: snapshot.exactSystemPrompt } : {}),
     };
   }
@@ -723,6 +769,19 @@ export function selectSubagentExtensionTools(
   return [...new Set(selected)];
 }
 
+export function readSubagentTelemetry(value: unknown): SubagentTelemetry | undefined {
+  if (!isRecord(value)
+    || !Number.isSafeInteger(value.turnCount) || (value.turnCount as number) < 0
+    || value.turnCountBasis !== "turn_end"
+    || !["completed", "abort-requested", "max-turns", "provider-error", "runtime-error"].includes(value.terminationReason as string)
+  ) return undefined;
+  return {
+    turnCount: value.turnCount as number,
+    turnCountBasis: "turn_end",
+    terminationReason: value.terminationReason as SubagentTelemetry["terminationReason"],
+  };
+}
+
 export function readSubagentRun(entries: readonly SessionEntry[], sessionId: string, sessionPath: string): SubagentRunInfo | null {
   const data = subagentMetadataData(entries);
   if (!data) return null;
@@ -737,6 +796,7 @@ export function readSubagentRun(entries: readonly SessionEntry[], sessionId: str
     ? lifecycleEntry
     : undefined;
   const statusData = statusEntry?.type === "custom" && isRecord(statusEntry.data) ? statusEntry.data : undefined;
+  const telemetry = readSubagentTelemetry(result?.telemetry);
   const persistedStatus = result && (result.status === "completed" || result.status === "failed" || result.status === "aborted")
     ? result.status
     : statusData?.version === 1 && (statusData.status === "queued" || statusData.status === "running")
@@ -759,5 +819,6 @@ export function readSubagentRun(entries: readonly SessionEntry[], sessionId: str
     ...(typeof data.worktreePath === "string" ? { worktreePath: data.worktreePath } : {}),
     ...(typeof data.worktreeBranch === "string" ? { worktreeBranch: data.worktreeBranch } : {}),
     ...(result && typeof result.worktreeCleanupError === "string" ? { worktreeCleanupError: result.worktreeCleanupError } : {}),
+    ...(telemetry ? { telemetry } : {}),
   };
 }

@@ -1,11 +1,16 @@
+// Attach metadata tracing to live dev servers too; the observer guards preload/HMR duplicates.
+import "../bin/proxy-observation.cjs";
+import { assertSharedPiWorkAdmission } from "./shared-pi-update.cjs";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
+import { hostRequestDiagnostics } from "./request-diagnostics";
+import { installRequestDiagnostics } from "./request-diagnostic-observer";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import {
   createProjectCommandBashExtension,
@@ -37,7 +42,8 @@ import {
   readSubagentSessionResources,
   SUBAGENT_CONTROL_TOOL_NAMES,
 } from "./subagents";
-import { createSubagentController } from "./subagent-runtime";
+import { createSubagentController, hasBusySubagentWork } from "./subagent-runtime";
+import { subagentResourceLoaderOptions, subagentSessionToolOptions } from "./subagent-resources";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
@@ -47,6 +53,8 @@ import type { McpHost } from "./mcp-host";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
 import { createReadOnlyMcpPolicyExtension } from "./mcp-read-only-policy";
 import { isNestedToolExecutionEvent } from "./agent-event-wire";
+import { computeObservedDecodeTps, OBSERVED_DECODE_TPS_ENTRY_TYPE, ObservedDecodeTpsEventTracker } from "./session-decode-tps";
+import { computeSessionStats } from "./session-stats";
 import {
   appendClearedSessionToolSelection,
   appendSessionToolSelection,
@@ -121,6 +129,7 @@ type AgentSessionWrapperOptions = {
   chatOnly?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
+  disposeRequestDiagnostics?: () => void;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
   mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
 };
@@ -295,6 +304,7 @@ export class AgentSessionWrapper {
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
+  private extensionBindingPending = false;
   private extensionBindingError: unknown = null;
   private readonly exactSystemPrompt?: () => string;
   private readonly chatOnly: boolean;
@@ -302,6 +312,7 @@ export class AgentSessionWrapper {
   private readonly suppressCompletionNotifications: boolean;
   private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
   private mcpHostDisposed = false;
+  private requestDiagnosticsDisposer?: () => void;
   // The MCP wait of the prompt being admitted; Stop ends it.
   private mcpPromptWait: { controller: AbortController; done: Promise<void> } | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -328,6 +339,13 @@ export class AgentSessionWrapper {
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.mcpHost = options.mcpHost;
+    this.requestDiagnosticsDisposer = options.disposeRequestDiagnostics;
+  }
+
+  disposeRequestDiagnostics(): void {
+    const dispose = this.requestDiagnosticsDisposer;
+    this.requestDiagnosticsDisposer = undefined;
+    try { dispose?.(); } catch { /* Diagnostics must not affect session lifecycle. */ }
   }
 
   get sessionId(): string {
@@ -363,6 +381,11 @@ export class AgentSessionWrapper {
     return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
+  isBusyForRuntimeUpdate(): boolean {
+    return this._alive && (this.closing || this.extensionBindingPending || this.activeMutatingCommands > 0
+      || this.isRunning() || this.inner.isIdle === false || this.inner.pendingMessageCount > 0);
+  }
+
   /**
    * Drop this idle wrapper when the on-disk JSONL has an entry the in-memory
    * index never saw (another pi process appended). Rechecks isRunning() so a
@@ -387,12 +410,26 @@ export class AgentSessionWrapper {
   }
 
   start(): void {
+    const decodeTpsTracker = new ObservedDecodeTpsEventTracker(() => Number(process.hrtime.bigint()) / 1_000_000);
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
+      decodeTpsTracker.observe(event);
       if (event.type === "agent_start") this.agentRunNeedsCompletion = true;
       if (event.type === "agent_end") {
         invalidateSessionListCache();
         // Every tool call of the run has finished; nothing is left to replay.
         this.activeToolEvents.clear();
+        try {
+          const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+          for (const record of decodeTpsTracker.drain(entries)) {
+            try {
+              this.inner.sessionManager.appendCustomEntry(OBSERVED_DECODE_TPS_ENTRY_TYPE, record);
+            } catch (error) {
+              console.warn(`[pi-web] failed to persist observed decode TPS for session ${this.sessionId}: ${String(error)}`);
+            }
+          }
+        } catch (error) {
+          console.warn(`[pi-web] failed to collect observed decode TPS for session ${this.sessionId}: ${String(error)}`);
+        }
       }
       this.trackActiveToolEvent(event);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
@@ -449,6 +486,7 @@ export class AgentSessionWrapper {
     if (this.extensionBindingPromise) return this.extensionBindingPromise;
 
     this.extensionBindingError = null;
+    this.extensionBindingPending = true;
     this.extensionBindingPromise = (async () => {
       if (!this._alive) return;
       const uiContext = this.createExtensionUiContext();
@@ -486,6 +524,8 @@ export class AgentSessionWrapper {
     })().catch((err) => {
       this.extensionBindingError = err;
       throw err;
+    }).finally(() => {
+      this.extensionBindingPending = false;
     });
 
     return this.extensionBindingPromise;
@@ -706,6 +746,7 @@ export class AgentSessionWrapper {
     }
 
     const tracksMutation = !allowedDuringReplacement;
+    if (tracksMutation) assertSharedPiWorkAdmission();
     if (tracksMutation) this.activeMutatingCommands += 1;
 
     try {
@@ -1058,8 +1099,13 @@ export class AgentSessionWrapper {
       }
 
       case "get_session_stats": {
+        const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+        const observedDecodeTps = computeObservedDecodeTps(entries);
+        const usageBreakdown = computeSessionStats(entries).usageBreakdown;
         return {
           ...this.inner.getSessionStats(),
+          usageBreakdown,
+          ...(observedDecodeTps ? { observedDecodeTps } : {}),
           sessionName: this.inner.sessionManager.getSessionName(),
         };
       }
@@ -1242,6 +1288,7 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    this.disposeRequestDiagnostics();
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
@@ -1296,6 +1343,7 @@ export class AgentSessionWrapper {
     // Closing starts before the first await, so a request that arrives while
     // extensions shut down starts a fresh wrapper instead of prompting this one.
     this.closing = true;
+    this.disposeRequestDiagnostics();
 
     this.shutdownPromise = (async () => {
       try {
@@ -1941,6 +1989,7 @@ function getRegistry(): Map<string, AgentSessionWrapper> {
 }
 
 function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
+  assertSharedPiWorkAdmission();
   const registry = getRegistry();
   const sessionId = wrapper.sessionId;
   if (wrapper.sessionFile) cacheSessionPath(sessionId, wrapper.sessionFile);
@@ -1954,6 +2003,7 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   const previous = registry.get(sessionId);
   if (previous && previous !== wrapper && typeof previous.onDestroy === "function") {
     previous.onDestroy(() => {});
+    previous.disposeRequestDiagnostics?.();
   }
   registry.set(sessionId, wrapper);
   wrapper.start();
@@ -2073,6 +2123,7 @@ export async function setRpcSessionTools(
   sessionFile: string | undefined,
   requestedToolNames: unknown,
 ): Promise<SetRpcSessionToolsResult> {
+  assertSharedPiWorkAdmission();
   const toolNames = requestedToolNames === undefined
     ? undefined
     : validateSessionToolSelection(requestedToolNames);
@@ -2245,6 +2296,15 @@ export function getRunningRpcSessionIds(): string[] {
   return [...ids];
 }
 
+export function hasBusyRpcWorkForRuntimeUpdate(): boolean {
+  return hasBusySubagentWork() || Boolean(globalThis.__piStartLocks?.size || globalThis.__piStartingSessionCwds?.size)
+    || [...(globalThis.__piSessions?.values() ?? [])].some((session) => session.isBusyForRuntimeUpdate());
+}
+
+export async function shutdownIdleRpcSessionsForRuntimeUpdate(): Promise<void> {
+  await Promise.all([...(globalThis.__piSessions?.values() ?? [])].map((session) => session.shutdown()));
+}
+
 export function getCompletionNotificationSuppressedRpcSessionIds(): string[] {
   const ids = new Set<string>();
   for (const [sessionId, session] of getRegistry()) {
@@ -2268,6 +2328,7 @@ export async function startRpcSession(
   cwd: string | undefined,
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  assertSharedPiWorkAdmission();
   const { initialModel, allowInitialModelFallback, thinkingLevel } = options;
   const requestedToolNames = options.toolNames === undefined
     ? undefined
@@ -2313,7 +2374,7 @@ export async function startRpcSession(
     appendSessionToolSelection(sessionManager, requestedToolNames);
   }
   const subagentLoadsResources = Boolean(
-    subagentResources?.loadExtensions || subagentResources?.loadSkills,
+    subagentResources?.loadExtensions || subagentResources?.loadSkills || subagentResources?.mcpServers?.length,
   );
   const chatOnly = selectedToolNames?.length === 0 && !subagentLoadsResources;
   const finishStartingSession = trackStartingSession(sessionCwd);
@@ -2360,14 +2421,20 @@ export async function startRpcSession(
     const builtins = subagentResources || chatOnly
       ? undefined
       : await createPiWebBuiltinExtensions({ agentDir });
+    const selectedSubagentResourceOptions = subagentResources
+      ? await subagentResourceLoaderOptions(subagentResources, sessionCwd, agentDir)
+      : undefined;
+    const requestDiagnostics = hostRequestDiagnostics();
+    const requestDiagnosticBus = requestDiagnostics ? createEventBus() : undefined;
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
       settingsManager,
-      resourceLoaderOptions: subagentResources
+      resourceLoaderOptions: {
+        ...(requestDiagnosticBus ? { eventBus: requestDiagnosticBus } : {}),
+        ...(subagentResources
         ? {
-            noExtensions: !subagentResources.loadExtensions,
-            noSkills: !subagentResources.loadSkills,
+            ...selectedSubagentResourceOptions,
             noPromptTemplates: true,
             noThemes: true,
             noContextFiles: true,
@@ -2378,7 +2445,10 @@ export async function startRpcSession(
                 }
               : {}),
             appendSystemPrompt: subagentResources.appendSystemPrompt,
-            ...(usesExactSystemPrompt ? { extensionFactories: [exactSystemPromptExtension] } : {}),
+            extensionFactories: [
+              ...(selectedSubagentResourceOptions?.extensionFactories ?? []),
+              ...(usesExactSystemPrompt ? [exactSystemPromptExtension] : []),
+            ],
           }
         : chatOnly
           ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension] }
@@ -2397,7 +2467,8 @@ export async function startRpcSession(
               ),
             ],
             extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
-          },
+          }),
+      },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
     const scope = await resolveVisibleModels(
@@ -2437,8 +2508,9 @@ export async function startRpcSession(
       ...(startupModel ? { model: startupModel } : {}),
       ...(initial?.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
       ...(scope.scopedModels.length > 0 ? { scopedModels: [...scope.scopedModels] } : {}),
-      ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
-      ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
+      ...(subagentResources
+        ? subagentSessionToolOptions(subagentResources, services.resourceLoader.getExtensions())
+        : toolsOption !== undefined ? { tools: toolsOption } : {}),
     });
 
     // A pinned selection replaces only the coding tools of the SDK's initial loadout, which
@@ -2463,6 +2535,9 @@ export async function startRpcSession(
     const wrapper = new AgentSessionWrapper(inner, {
       exactSystemPrompt,
       chatOnly,
+      ...(requestDiagnostics && requestDiagnosticBus ? {
+        disposeRequestDiagnostics: installRequestDiagnostics(inner, requestDiagnosticBus, requestDiagnostics),
+      } : {}),
       onAgentRunComplete: (completedSessionId) => {
         void notifySessionComplete(completedSessionId).catch((error) => {
           console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);

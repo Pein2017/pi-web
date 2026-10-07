@@ -9,8 +9,8 @@ const jiti = createJiti(import.meta.url, {
 const { BranchNavigator, buildActivePath, compressChain, hasSessionBranches, selectTopLevelBranches } = await jiti.import("./BranchNavigator.tsx");
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { I18nProvider } = await jiti.import("@/hooks/useI18n.tsx");
-const { enLocale } = await jiti.import("@/lib/i18n/messages/en.ts");
+const { I18nProvider, useI18n } = await jiti.import("@/hooks/useI18n.tsx");
+const { OBSERVED_DECODE_TPS_ENTRY_TYPE } = await jiti.import("@/lib/session-decode-tps.ts");
 
 const msg = (id, role, text) => ({ type: "message", id, parentId: null, timestamp: "t", message: { role, content: text } });
 const info = (id) => ({ type: "session_info", id, parentId: null, timestamp: "t", name: "x" });
@@ -22,6 +22,22 @@ test("compressChain labels a chain by its first message entry", () => {
   const { labelEntry, node: rep } = compressChain(chain);
   assert.equal(labelEntry.id, "u1");
   assert.equal(rep.entry.id, "a1");
+});
+
+test("compressChain does not count observed-TPS metadata as a user-visible skipped entry", () => {
+  const metric = {
+    type: "custom",
+    id: "tps1",
+    parentId: "s1",
+    timestamp: "t",
+    customType: OBSERVED_DECODE_TPS_ENTRY_TYPE,
+    data: { version: 1 },
+  };
+  const chain = node(info("s1"), [node(metric, [node(msg("u1", "user", "问题"), [node(msg("a1", "assistant", "回答"))])])]);
+  const { labelEntry, node: rep, skipped } = compressChain(chain);
+  assert.equal(labelEntry.id, "u1");
+  assert.equal(rep.entry.id, "a1");
+  assert.equal(skipped, 2);
 });
 
 test("compressChain skips non-message entries such as session_info", () => {
@@ -195,16 +211,24 @@ test("a locked navigator keeps the tree readable but offers no branch to switch 
       locked,
     }),
   ));
-  const lockedNotice = enLocale.messages["i18n.branchesLockedWhileRunning"].replace("'", "&#x27;");
+  // Resolve and escape the notice through the same provider as the navigator;
+  // its default locale is independent of the branch-locking contract.
+  function LockedNotice() {
+    return useI18n().t("i18n.branchesLockedWhileRunning");
+  }
+  const lockedNotice = renderToStaticMarkup(React.createElement(
+    I18nProvider, null, React.createElement(LockedNotice),
+  ));
+  assert.ok(lockedNotice.length > 0);
 
   const unlocked = render(false);
   assert.match(unlocked, /second answer/);
   assert.equal((unlocked.match(/cursor:pointer/g) ?? []).length, 3);
-  assert.doesNotMatch(unlocked, new RegExp(lockedNotice));
+  assert.equal(unlocked.includes(lockedNotice), false);
 
   const locked = render(true);
   assert.match(locked, /second answer/);
-  assert.match(locked, new RegExp(lockedNotice));
+  assert.equal(locked.includes(lockedNotice), true);
   // Only the panel header stays clickable; branch rows are not.
   assert.equal((locked.match(/cursor:pointer/g) ?? []).length, 1);
   assert.equal((locked.match(/cursor:default/g) ?? []).length, 2);

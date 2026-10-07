@@ -38,6 +38,7 @@ import {
 } from "./SettingsUi";
 import { ModelSelector } from "./ModelSelector";
 import { projectTrustReloadKey } from "./settings-ui-helpers";
+import { normalizeAgentResourceDraft } from "./agent-resource-editor";
 
 const TOOL_OPTIONS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const THINKING_OPTIONS = ["", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -87,10 +88,18 @@ function editableProfile(profile: SubagentProfile): EditableProfile {
     tools: [...profile.tools],
     loadSkills: profile.loadSkills,
     loadExtensions: profile.loadExtensions,
+    ...(profile.skillNames !== undefined ? { skillNames: [...profile.skillNames] } : {}),
+    ...(profile.extensionPaths !== undefined ? { extensionPaths: [...profile.extensionPaths] } : {}),
+    ...(profile.mcpServers !== undefined ? { mcpServers: [...profile.mcpServers] } : {}),
+    ...(profile.mcpTools !== undefined ? { mcpTools: [...profile.mcpTools] } : {}),
+    ...(profile.extensionTools !== undefined ? { extensionTools: [...profile.extensionTools] } : {}),
     promptMode: profile.promptMode,
     ...(profile.model ? { model: profile.model } : {}),
     ...(profile.thinking ? { thinking: profile.thinking } : {}),
     ...(profile.maxTurns ? { maxTurns: profile.maxTurns } : {}),
+    ...(profile.color !== undefined ? { color: profile.color } : {}),
+    ...(profile.isolation !== undefined ? { isolation: profile.isolation } : {}),
+    ...(profile.persistSession !== undefined ? { persistSession: profile.persistSession } : {}),
     inheritContext: profile.inheritContext,
     runInBackground: profile.runInBackground,
     enabled: profile.enabled,
@@ -322,7 +331,7 @@ export function AgentsConfig({
       const response = await fetch("/api/subagents/profiles", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, scope: targetScope, profile: draft }),
+        body: JSON.stringify({ cwd, scope: targetScope, profile: normalizeAgentResourceDraft(draft) }),
       });
       const data = await response.json() as { profile?: SubagentProfile; error?: string };
       if (!response.ok || data.error || !data.profile) throw new Error(data.error ?? `HTTP ${response.status}`);
@@ -612,6 +621,32 @@ export function AgentsConfig({
                       <Toggle label={t("agents.loadExtensions")} disabled={disabled} checked={draft.loadExtensions} onChange={(checked) => update("loadExtensions", checked)} />
                     </div>
                   </Field>
+
+                  {(["skillNames", "extensionPaths", "mcpTools"] as const).map((key) => (
+                    <Field key={key} label={t(`agents.resource.${key}`)}>
+                      <select
+                        aria-label={t(`agents.resource.${key}`)}
+                        value={draft[key] === undefined ? "all" : "selected"}
+                        disabled={disabled}
+                        onChange={(event) => update(key, event.target.value === "all" ? undefined : [])}
+                        style={controlStyle}
+                      >
+                        <option value="all">{t("agents.resource.all")}</option>
+                        <option value="selected">{t("agents.resource.selected")}</option>
+                      </select>
+                      {draft[key] !== undefined && <input
+                        aria-label={t("agents.resource.selectors", { resource: t(`agents.resource.${key}`) })}
+                        value={draft[key].join(",")}
+                        disabled={disabled}
+                        onChange={(event) => update(key, event.target.value.split(","))}
+                        style={controlStyle}
+                      />}
+                    </Field>
+                  ))}
+                  <Field label={t("agents.resource.mcpServers")}>
+                    <input aria-label={t("agents.resource.mcpServers")} value={(draft.mcpServers ?? []).join(",")} disabled={disabled} onChange={(event) => update("mcpServers", event.target.value.split(","))} style={controlStyle} />
+                  </Field>
+                  <span style={{ color: "var(--text-dim)", fontSize: 11 }}>{t("agents.resource.help")}</span>
 
                   <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 1.5fr) minmax(120px, 0.75fr) minmax(100px, 0.5fr)", gap: 12 }}>
                     <Field label={t("agents.model")}>

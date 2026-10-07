@@ -23,6 +23,8 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      # Optional SDK peers are supplied by the local managed runtime, not npm ci.
+      - run: npm install --no-save --package-lock=false @earendil-works/pi-coding-agent@1.0.3 @earendil-works/pi-agent-core@1.0.3 @earendil-works/pi-ai@1.0.3 @earendil-works/pi-tui@1.0.3
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
@@ -37,6 +39,7 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      - run: npm install --no-save --package-lock=false @earendil-works/pi-coding-agent@1.0.3 @earendil-works/pi-agent-core@1.0.3 @earendil-works/pi-ai@1.0.3 @earendil-works/pi-tui@1.0.3
       - run: npx playwright install --with-deps chromium
       - run: npm run build
       - run: npm run test:e2e

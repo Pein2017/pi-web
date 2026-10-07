@@ -2,8 +2,8 @@ import coreWebVitals from "eslint-config-next/core-web-vitals";
 import typescript from "eslint-config-next/typescript";
 
 const eslintConfig = [
-  // demo/ is a separate Next.js project with its own lint config.
-  { ignores: ["demo/**"] },
+  // demo/ has its own checks; private runtime/recovery and index files are not source.
+  { ignores: ["demo/**", ".local/**", ".codegraph/**"] },
   ...coreWebVitals,
   ...typescript,
   {

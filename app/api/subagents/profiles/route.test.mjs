@@ -177,6 +177,20 @@ test("profiles route toggles a built-in through settings.json without writing a 
   assert.deepEqual(await response.json(), { error: "Agent profile not found" });
 });
 
+test("toggling a resource profile preserves shared-runtime metadata", async t => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-web-subagent-toggle-"));
+  allowFileRoot(cwd);
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const legacy = { color: "cyan", isolation: "worktree", persistSession: false };
+  const saved = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile(legacy) }));
+  assert.equal(saved.status, 200);
+  const toggled = await PATCH(jsonRequest("PATCH", { cwd, scope: "project", name: "api-test-agent", enabled: false }));
+  assert.equal(toggled.status, 200);
+  const response = await GET(new Request(`http://localhost/api/subagents/profiles?cwd=${encodeURIComponent(cwd)}`));
+  const loaded = (await response.json()).profiles.find(p => p.name === "api-test-agent");
+  for (const [key, value] of Object.entries(legacy)) assert.equal(loaded[key], value, key);
+});
+
 test("profiles route rejects missing paths, malformed profiles, and unsafe names", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-web-subagent-route-"));
   allowFileRoot(cwd);
@@ -224,4 +238,38 @@ test("profiles route rejects missing paths, malformed profiles, and unsafe names
   response = await PATCH(jsonRequest("PATCH", { cwd, scope: "project", name: "api-test-agent" }));
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "enabled required" });
+});
+
+test("resource selectors round-trip through API, toggle, old clients, empty lists and explicit resets", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-web-subagent-selectors-"));
+  allowFileRoot(cwd);
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const selection = { skillNames: ["shared-memory"], extensionPaths: ["./.pi/extensions/coordexp-rtk.ts"], mcpServers: ["shared-memory"], mcpTools: ["shared-memory/search", "shared-memory/read"] };
+  let response = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile(selection) }));
+  assert.equal(response.status, 200);
+  const assertSelection = data => { for (const key of Object.keys(selection)) assert.deepEqual(data.profile[key], selection[key]); };
+  assertSelection(await response.json());
+  response = await PATCH(jsonRequest("PATCH", { cwd, scope: "project", name: "api-test-agent", enabled: false }));
+  assert.equal(response.status, 200);
+  assertSelection(await response.json());
+  response = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile() }));
+  assert.equal(response.status, 200);
+  assertSelection(await response.json());
+  response = await GET(new Request(`http://localhost/api/subagents/profiles?cwd=${encodeURIComponent(cwd)}`));
+  assertSelection({ profile: (await response.json()).profiles.find(p => p.name === "api-test-agent") });
+  response = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile({ skillNames: [], extensionPaths: [], mcpServers: [], mcpTools: [] }) }));
+  assert.equal(response.status, 200);
+  const empty = await response.json();
+  for (const key of Object.keys(selection)) assert.deepEqual(empty.profile[key], []);
+  response = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile({ skillNames: null, extensionPaths: null, mcpServers: null, mcpTools: null }) }));
+  assert.equal(response.status, 200);
+  const reset = await response.json();
+  for (const key of Object.keys(selection)) assert.equal(reset.profile[key], undefined);
+  response = await GET(new Request(`http://localhost/api/subagents/profiles?cwd=${encodeURIComponent(cwd)}`));
+  const loaded = (await response.json()).profiles.find(p => p.name === "api-test-agent");
+  for (const key of Object.keys(selection)) assert.equal(loaded[key], undefined);
+  for (const invalid of [{ skillNames: Array(65).fill("skill") }, { mcpServers: ["*"] }, { mcpTools: ["mcp__shared_memory__search"] }, { extensionPaths: ["pi-advisor-flow"] }]) {
+    response = await PUT(jsonRequest("PUT", { cwd, scope: "project", profile: profile(invalid) }));
+    assert.equal(response.status, 400);
+  }
 });

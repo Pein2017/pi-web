@@ -19,6 +19,8 @@ import { TerminalPanel } from "./TerminalPanel";
 import { newTerminalTab, restoreTerminalTabs, TERMINAL_TABS_KEY, type TerminalTab } from "./terminal-tab-state";
 import { useTheme } from "@/hooks/useTheme";
 import { useI18n } from "@/hooks/useI18n";
+import { SessionDecodeTpsSection } from "../../components/SessionDecodeTpsSection";
+import { buildSessionCacheRateRows, buildSessionUsageBreakdownRows } from "../../lib/session-usage-breakdown";
 import { useIsMobile, useIsNarrowMobile } from "@/hooks/useIsMobile";
 import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
@@ -2161,13 +2163,12 @@ export function AppShell() {
                     ];
                     const ctx = contextUsage ?? sessionStats.contextUsage;
                     const formatCompact = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
+                    const usageBreakdownRows = buildSessionUsageBreakdownRows(sessionStats.usageBreakdown, translate, locale)
+                      .map(({ label, value }) => [label, value]);
                     const extraTokenRows = [
                        ...(sessionStats.cost > 0 ? [[translate("session.cost"), `$${sessionStats.cost.toFixed(4)}`]] : []),
                        ...(ctx?.contextWindow ? [[translate("session.context"), `${ctx.percent !== null ? `${ctx.percent.toFixed(1)}%` : "?"} / ${formatCompact(ctx.contextWindow)}`]] : []),
-                       // Cache hit rate = cache reads / (input + cache writes + cache reads) — the denominator covers all input-class tokens.
-                       ...(sessionStats.tokens.cacheRead + sessionStats.tokens.cacheWrite > 0 && sessionStats.tokens.cacheRead + sessionStats.tokens.cacheWrite + sessionStats.tokens.input > 0
-                         ? [[translate("session.cacheHitRate"), `${(sessionStats.tokens.cacheRead / (sessionStats.tokens.cacheRead + sessionStats.tokens.cacheWrite + sessionStats.tokens.input) * 100).toFixed(1)}%`]]
-                         : []),
+                       ...buildSessionCacheRateRows(sessionStats, translate).map(({ label, value }) => [label, value]),
                     ];
                     const section = (
                       title: string,
@@ -2310,7 +2311,15 @@ export function AppShell() {
                           {projectInfoSection}
                         </div>
                          {section(translate("session.messages"), messageRows)}
-                         {section(translate("session.tokens"), [...tokenRows, ...extraTokenRows], "right", true)}
+                         <div style={{ minWidth: 0 }}>
+                           {section(translate("session.tokens"), [...tokenRows, ...extraTokenRows], "right", true)}
+                           {section(translate("session.usage.breakdown"), usageBreakdownRows, "right", true)}
+                           <SessionDecodeTpsSection
+                             summary={sessionStats.observedDecodeTps}
+                             locale={locale}
+                             translate={translate}
+                           />
+                         </div>
                       </div>
                     );
                   })() : (

@@ -15,14 +15,16 @@ Pi Web's own OpenSpec root is this repository's `openspec/`.
 Existing local changes to Simplified Chinese defaults and allowed development
 origins were preserved. Web dependencies are retained in `node_modules/`;
 its `@earendil-works` scope links to the official managed Pi release selected
-under `/data/CoordExp/.pi/install`. Web and terminal now share Pi 1.0.3.
+under `/data/CoordExp/codex-tools/pi-core/.local/install`.
+Web and terminal now share Pi 1.0.3.
 The generated Next development cache is
 rebuilt at the new path; do not run `next build` alongside the development server.
 
 Pi Web and terminal Pi use one private profile at `/data/CoordExp/.pi`.
 `bin/local-dev.sh` and `/data/CoordExp/bin/pi` explicitly select that directory;
 `/root/.local/bin/pi` points to the latter wrapper, which executes the managed
-Pi launcher at `/data/CoordExp/.pi/bin/pi`. Shell startup exports
+Pi launcher at `/data/CoordExp/codex-tools/pi-core/.local/bin/pi`.
+Shell startup exports
 the same path. Session storage uses its default `<agent-dir>/sessions` without
 a separate environment override. Existing project MCP entries at this root
 remain the shared entries. No old profile is used as a fallback.
@@ -48,19 +50,26 @@ credential, existing root MCP entries, prior trust decisions and the union of
 21 session IDs. Duplicate older histories were checked as prefixes of the
 retained histories; message payloads were preserved and session path metadata
 was rebound. Automatic retry and compaction remain enabled. The active
-server-compaction package is maintained local source at
-`/data/CoordExp/codex-tools/pi-openai-server-compaction`; the pinned Git copy is
-retained as original diagnostic/recovery material. The local repair uses
-credential-compatible storage, proven response deltas and official opaque
-compaction replay. See [cache diagnosis](cache-diagnosis-20261005.md).
+server-compaction module is now owned by the independent local repository
+`/data/CoordExp/codex-tools/pi-extensions`, under `packages/pi-codex-compact`.
+The shared profile selects a versioned, packaged runtime from that repository's
+ignored `.local/releases/`; it loads generated `dist/index.ts` rather than editable
+source or the official npm installation. Local release ownership and qualification
+are documented in [local compaction](../../pi-extensions/docs/local-compaction.md).
+The current credential-compatible protocol remains `context-management`.
+Manual compaction waits for a prompt; active automatic compaction carries a task
+continuation after the opaque checkpoint. Existing legacy compaction source and
+diagnostic receipts remain at their original owners, outside active registration.
 CodeGraph, Shared Memory, shared skills and the 9090 proxy retain
-their existing owners. Node.js and the Pi executables remain installed at their
-existing locations. The user's concurrent terminal Pi update was reconciled:
-managed CLI 1.0.3 lives in the shared profile's `install/`. The subsequent
-user-requested runtime unification made Web load that same installation.
+their existing owners. Node.js retains its existing owner; official Pi source
+reference and the sole managed distribution now live under
+`/data/CoordExp/codex-tools/pi-core`. The shared profile contains settings,
+credentials, sessions and ancillary tools, independently of the installation.
 The previous global npm CLI was already uninstalled by the terminal update.
-`pi update` updates the managed installation; restart Web afterward to load
-the selected release. See [shared Pi runtime](shared-pi-runtime.md).
+`pi update` updates the managed installation. Web automatically adopts the
+selected release after active tasks, queued work and terminal shells finish;
+new CLI launches use it immediately. See [shared Pi runtime](shared-pi-runtime.md)
+and [per-repository source indexes](pi-source-navigation.md).
 
 Start one development server:
 
@@ -70,7 +79,7 @@ tmux new-session -d -s pi-web -c /data/CoordExp/codex-tools/pi-web \
 tail -f /data/CoordExp/codex-tools/pi-web/.local/logs/dev.log
 ```
 
-The launcher binds `127.0.0.1:30141`, explicitly selects the shared agent
+The launcher binds `127.0.0.1:12345`, explicitly selects the shared agent
 profile and routes server HTTP(S) requests through `http://127.0.0.1:9090`.
 `NO_PROXY` only exempts localhost and 127.0.0.1. It preserves the current public
 allowed hostname `agegr.pein17.com`. SSH and Cloudflare configuration remain at
@@ -82,6 +91,42 @@ transport observer logs connection destinations and OpenAI request error codes;
 it records no request headers, credentials, bodies or prompts. A successful short
 request proves that request only; proxy routing cannot guarantee upstream health
 or sustained streaming reliability.
+
+### Transport diagnostics
+
+`bin/proxy-observation.cjs` owns the `[pi-web-transport]` JSON records in
+`.local/logs/dev.log`. Version 2 correlates requests with connections and records
+HTTP status, header latency, received byte totals, time since the last data,
+socket endpoints/age and bounded error causes. It only allows the response
+`x-request-id` header; request headers, query strings, bodies and arbitrary
+error messages are excluded. Body chunks update counters without being logged.
+The server RPC module also loads this observer, so development hot reload can
+attach it without stopping running sessions. A process-wide guard prevents
+duplicate subscriptions from preload and module reload.
+An already-running version-1 preload can keep emitting unversioned records
+until its next authorized restart; filter `version: 2` for the new diagnostics.
+
+For proxy failures, correlate these records with the existing FRP server log at
+`/var/log/pein-train-frps.log`. Its timestamps and the Web JSON timestamps use
+UTC on this host; add eight hours for Beijing time. On 2026-10-06 the `9090`
+proxy repeatedly closed and re-registered about every 185 seconds. At
+11:18:48.514 and 11:21:52.675 UTC, FRP closed the proxy 2–3 ms before the
+matching Web socket errors. The bounded receipt is
+`.local/diagnostics/transport-20261006-01a11021/frp-correlation.json`.
+This locates the observed interruption at the shared tunnel lifecycle; the
+reason for the Mac client's repeated reconnects still needs its client log.
+
+Installed Pi 1.0.3's `openai-responses` adapter always uses HTTP/SSE and ignores
+the generic `transport` option. Its separate Codex adapter supports WebSocket,
+but changing adapters requires checking endpoint/auth/model and compaction
+behavior. A WebSocket would still traverse the same `9090` tunnel. Keep the
+current route while diagnosing the tunnel; neither more retries nor longer
+HTTP idle timeouts repairs a forced tunnel closure.
+
+The local Web port changed from `30141` to `12345` on 2026-10-06 at the
+user's request. Direct access on this server is `http://localhost:12345`.
+The historical Mac/SSH/Cloudflare route below uses `30141`; an SSH forward
+using that route must target this server's `12345` after this change.
 
 ## Phone browser access
 
