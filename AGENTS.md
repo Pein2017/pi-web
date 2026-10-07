@@ -1,5 +1,25 @@
 # Pi Web - Development Notes
 
+## Fork ownership and change management
+
+This is Pein2017's independently maintained fork of `agegr/pi-web`, with its
+own Git repository, `main` branch, documentation and OpenSpec root. Its location
+under another project's directory does not make that project's specs or research
+policy the owner of Pi Web changes. Keep user-wide instructions at their existing
+owner; do not copy them into this repository.
+
+- `origin`: `https://github.com/Pein2017/pi-web.git`; `upstream`: original author.
+  Fetch upstream explicitly; review and test before merging. Preserve local
+  features and unrelated dirty work; never force-sync our `main` to upstream.
+- Run OpenSpec from this repository and verify `openspec context --json` resolves
+  here before writing artifacts. All Pi Web specs/changes belong in `openspec/`,
+  never an ancestor project or external store unless the user changes that owner.
+- Read [fork maintenance](docs/fork-maintenance.md) for synchronization,
+  publication and independent-project boundaries; [OpenSpec](openspec/README.md)
+  for the local workflow. New consequential features use that workflow.
+- Pi Core, extension packages and private profiles remain separate owners.
+  Never commit credentials, sessions, local logs or managed runtime installations.
+
 ## Quick Start
 
 ```bash

@@ -2,10 +2,15 @@
 
 The maintained checkout is `/data/CoordExp/codex-tools/pi-web`, based on
 `agegr/pi-web` commit `6fcd7d44981ab51a21d6cd6eb06d361d0e3d3068` (v0.10.0).
-The maintained local branch is `main`; both `origin` and `upstream`
-currently identify `https://github.com/agegr/pi-web.git`. Local development does
-not publish to GitHub. Upstream updates require an explicit fetch, reviewed
-integration and revalidation.
+The maintained branch is `main` in the independent fork
+`https://github.com/Pein2017/pi-web`. `origin` identifies that fork; `upstream`
+fetches `https://github.com/agegr/pi-web.git` and has pushing disabled locally.
+The initial fork setup also merged upstream commit
+`038057f4797568394fd2a8f4a800e2e5d1bef071` without discarding local features.
+Upstream updates require an explicit fetch, reviewed integration and revalidation;
+publication and runtime adoption remain separate actions. Project ownership and
+synchronization are documented in [fork maintenance](fork-maintenance.md), and
+Pi Web's own OpenSpec root is this repository's `openspec/`.
 
 Existing local changes to Simplified Chinese defaults and allowed development
 origins were preserved. Web dependencies are retained in `node_modules/`;

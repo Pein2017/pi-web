@@ -1,0 +1,32 @@
+schema: spec-driven
+
+context: |
+  Project: Pein2017/pi-web, an independently maintained GitHub fork of agegr/pi-web.
+  Our maintained/default branch is main. origin is our fork; upstream is the
+  original author's repository. Preserve local features during upstream merges;
+  fetch is not permission to reset main, publish changes, or restart services.
+  Stack: TypeScript, React 19, Next.js 16, Node.js >=22.19, official Pi SDK.
+  Architecture: browser composer -> Web API -> in-process Pi AgentSession;
+  SDK events feed browser SSE and persistent session views.
+  Pi Web owns this repository's source, tests, docs, and openspec/ planning.
+  Do not place Pi Web changes in an ancestor project's OpenSpec root or use its
+  research contracts as Pi Web requirements. No external OpenSpec store is used.
+  Pi Core, extension repositories, credentials and session profiles are separate
+  owners. Prefer Web adapters and public SDK extensions over changing Pi Core.
+  Current machine-specific development uses a shared managed Pi installation
+  and a private profile; these are deployment dependencies, not vendored source.
+  See AGENTS.md, docs/fork-maintenance.md and relevant docs/agents/ notes.
+  Keep upstream attribution and licensing. npm publication under @agegr/pi-web
+  is not authorized by fork development or a Git push.
+  Existing uncommitted work must not be reset, broadly staged or silently
+  represented as a qualified/published feature.
+  Tests use node:test; use scoped tests, TypeScript checks and affected lint.
+  Never run next build against the active development server's .next directory.
+
+rules:
+  proposal:
+    - State local feature scope, upstream compatibility and explicit non-goals.
+  design:
+    - Identify the actual caller-to-consumer path and any separate SDK/runtime owner.
+  tasks:
+    - Include acceptance checks for retained local behavior and upstream integration.
