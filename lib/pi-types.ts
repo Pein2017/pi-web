@@ -164,6 +164,13 @@ export interface AgentSessionLike {
       /** The declared tools, with the descriptions `prepareLoadout` hooks set for the model. */
       readonly tools?: readonly { readonly name: string; readonly description: string }[];
     };
+    /** Public Agent input methods used to bind durable Web message metadata to actual SDK messages. */
+    prompt?: {
+      (message: PiAgentMessage | PiAgentMessage[]): Promise<void>;
+      (input: string, images?: ImageContent[]): Promise<void>;
+    };
+    steer?: (message: PiAgentMessage) => void;
+    followUp?: (message: PiAgentMessage) => void;
   };
   readonly extensionRunner: ExtensionRunnerLike;
   readonly promptTemplates: readonly PromptTemplateLike[];
@@ -176,7 +183,7 @@ export interface AgentSessionLike {
   prompt(text: string, options?: {
     images?: Array<{ type: "image"; data: string; mimeType: string }>;
     streamingBehavior?: "steer" | "followUp";
-    source?: "interactive" | "rpc";
+    source?: "interactive" | "rpc" | "extension";
     /** Called once the SDK accepts the input; a rejected prompt only rejects the returned promise. */
     preflightResult?: (disposition: "handled" | "queued" | "started") => void;
   }): Promise<void>;

@@ -7,6 +7,28 @@
 - The closing wrapper stays in `__piSessions` until disposed or replaced; its `onDestroy` removes the entry only while it still points at that wrapper, or a late cleanup would unregister the replacement. `registerRpcWrapper()` clears the callback of the entry it replaces (a pre-hot-reload wrapper still deletes by id).
 - Extensions get `PI_WEB_SHUTDOWN_DEADLINE_MS` (5 s; `0` or invalid keeps the default) for `session_shutdown`, then the wrapper logs once and disposes anyway: closing an MCP connection has no upper bound. Extension binding is awaited first, without a deadline.
 
+## Inline skills: short user text and separate context
+
+Web inline `$skill` loading preflights against the current resource catalog before
+submission. The exact instruction snapshots travel on the actual SDK user-message
+object as versioned `piWeb.inlineSkillContext` metadata, outside `content`.
+A Web-owned adapter around public `Agent.prompt/steer/followUp` attaches the
+snapshot at the message boundary; a public `context` extension projects distinct
+skill context messages only for the model request. Do not create a second
+`nextTurn` queue or join pending snapshots by user text: handled input, concurrent
+steer/follow-up and cancellation would leak or reorder instructions.
+
+Persisted metadata is the historical snapshot, never permission to re-read its
+path on reopen. Rebuild projections only from retained messages on the selected
+SDK context/branch, without resurrecting compacted or abandoned history. The
+adapter is Web-only; native Pi CLI does not reproject this namespace. The UI
+shows short content with compact references and opt-in instruction inspection;
+legacy appended inline envelopes receive display-only restoration. The client
+must replace an adjacent optimistic user bubble with the authoritative delivered
+object even when its text is unchanged, or its new snapshot metadata is lost.
+See [inline skills](../inline-skills.md) and
+[correction qualification](../inline-skill-context-qualification.md).
+
 ## Fork never touches the running AgentSession
 Never fork through `AgentSession.fork()` / `AgentSessionRuntime.fork()`: they replace the session in place (`inner.sessionId` becomes the new id; the current run is aborted first), so a wrapper registered under the old id would serve the forked state and corrupt the `parentSession` chain.
 

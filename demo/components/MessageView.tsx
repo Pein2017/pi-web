@@ -17,6 +17,7 @@ import { isThinkingExpandedByDefault, THINKING_EXPANDED_EVENT } from "@/lib/thin
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
 import type { WrittenFile } from "@/lib/turn-written-files";
 import { skillExpansionToCommand } from "@/lib/slash-display";
+import { getSkillContextDisplay } from "@/lib/skill-context-display";
 import { preserveSkillReferencesInMarkdown } from "@/lib/skill-mention-completion";
 import type { SubagentToolDetails } from "@/lib/subagent-extension";
 import type {
@@ -243,12 +244,20 @@ function formatTime(ts?: number): string | null {
   return `${date} ${time}`;
 }
 
+export function stripInlineSkillContextForEdit(message: UserMessage): UserMessage {
+  if (!message.piWeb?.inlineSkillContext) return message;
+  const editableMessage = { ...message };
+  delete editableMessage.piWeb;
+  return editableMessage;
+}
+
 export function replaceUserMessageText(message: UserMessage, text: string): UserMessage {
-  if (typeof message.content === "string") return { ...message, content: text };
+  const editableMessage = stripInlineSkillContextForEdit(message);
+  if (typeof editableMessage.content === "string") return { ...editableMessage, content: text };
 
   const content: Array<TextContent | ImageContent> = [];
   let replaced = false;
-  for (const block of message.content) {
+  for (const block of editableMessage.content) {
     if (block.type !== "text") {
       content.push(block);
       continue;
@@ -259,7 +268,7 @@ export function replaceUserMessageText(message: UserMessage, text: string): User
     }
   }
   if (!replaced) content.unshift({ type: "text", text });
-  return { ...message, content };
+  return { ...editableMessage, content };
 }
 
 function haveSameRelevantToolResults(
@@ -348,7 +357,16 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
       ? []
       : message.content.filter((b): b is ImageContent => b.type === "image");
 
-  const markdownContent = useMemo(() => preserveSkillReferencesInMarkdown(content), [content]);
+  const skillContext = useMemo(
+    () => getSkillContextDisplay(content, message.piWeb?.inlineSkillContext),
+    [content, message.piWeb],
+  );
+  const hasSkillContext = skillContext.skills.length > 0;
+  const displayContent = skillContext.prompt;
+  const markdownContent = useMemo(
+    () => preserveSkillReferencesInMarkdown(skillContext.prompt, skillContext.skills.map(({ name }) => name)),
+    [skillContext],
+  );
   const commandText = skillExpansionToCommand(content);
   const commandSeparator = commandText?.search(/\s/) ?? -1;
   const commandName = commandText
@@ -360,11 +378,15 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
 
   const time = formatTime(message.timestamp);
   const canFork = !!entryId && !!onFork;
-  const copyTarget = commandText ?? content;
-  const editTarget = commandText ? replaceUserMessageText(message, commandText) : message;
+  const copyTarget = commandText ?? skillContext.prompt;
+  const editTarget = commandText
+    ? replaceUserMessageText(message, commandText)
+    : skillContext.source !== "raw"
+      ? replaceUserMessageText(message, skillContext.prompt)
+      : stripInlineSkillContextForEdit(message);
 
   const imageBlocksNode = imageBlocks.length > 0 && (
-    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: content ? 8 : 0 }}>
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: displayContent ? 8 : 0 }}>
       {imageBlocks.map((img, i) => {
         // lib/types.ts ImageContent uses {source:{type,data,media_type,url}}
         // pi-ai on-disk format uses flat {data, mimeType} — handle both
@@ -480,10 +502,41 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                 <MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{markdownContent}</MarkdownBody>
               )}
             </div>
+          ) : hasSkillContext ? (
+            <div data-skill-context={skillContext.source} style={{ display: "flex", flexDirection: "column", gap: 7, minWidth: 0 }}>
+              {imageBlocksNode}
+              {displayContent && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{markdownContent}</SafeMarkdownBody>}
+              <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 5, fontSize: 11 }}>
+                <span style={{ color: "var(--text-dim)" }}>{t("i18n.inlineSkills")}</span>
+                {skillContext.skills.map(({ name }) => (
+                  <span key={name} style={{ padding: "1px 6px", borderRadius: 999, background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--accent)", fontFamily: "var(--font-mono)" }}>
+                    {`$${name}`}
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setExpanded((prev) => !prev)}
+                  aria-expanded={expanded}
+                  style={{ padding: 0, border: "none", background: "none", color: "var(--text-muted)", cursor: "pointer", font: "inherit", textDecoration: "underline", textUnderlineOffset: 2 }}
+                >
+                  {t(expanded ? "i18n.hideSkillInstructions" : "i18n.showSkillInstructions")}
+                </button>
+              </div>
+              {expanded && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, borderTop: "1px solid var(--border)", paddingTop: 7 }}>
+                  {skillContext.skills.map(({ name, location, body }) => (
+                    <div key={name}>
+                      <div style={{ marginBottom: 3, color: "var(--text-muted)", fontSize: 11, fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>{`$${name} · ${location}`}</div>
+                      {body && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{body}</SafeMarkdownBody>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
           <>
           {imageBlocksNode}
-          {content && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{markdownContent}</SafeMarkdownBody>}
+          {displayContent && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{markdownContent}</SafeMarkdownBody>}
           </>
           )}
         </div>

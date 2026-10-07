@@ -14,6 +14,19 @@ export interface InlineSkillResource {
   disableModelInvocation?: boolean;
 }
 
+export interface InlineSkillSnapshot {
+  name: string;
+  filePath: string;
+  baseDir: string;
+  body: string;
+}
+
+export interface InlineSkillContextSnapshot {
+  version: 1;
+  requestId: string;
+  skills: InlineSkillSnapshot[];
+}
+
 /** Windows has no FIFOs, and does not define O_NONBLOCK. */
 const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NONBLOCK || 0);
 
@@ -80,12 +93,13 @@ function readRegisteredSkill(
  * Limits apply to the full SKILL.md files (including frontmatter), not just the
  * stripped body: 16 distinct resources, 128 KiB each and 1 MiB total.
  */
-export function expandInlineSkillMentions(
+export function snapshotInlineSkillMentions(
   text: string,
   skills: readonly InlineSkillResource[],
-): string {
+  requestId: string,
+): InlineSkillContextSnapshot | undefined {
   const mentions = scanSkillMentions(text);
-  if (mentions.length === 0) return text;
+  if (mentions.length === 0) return undefined;
 
   const catalog = new Map<string, InlineSkillResource>();
   for (const skill of skills) {
@@ -100,13 +114,13 @@ export function expandInlineSkillMentions(
     selectedNames.add(skill.name);
     selected.push(skill);
   }
-  if (selected.length === 0) return text;
+  if (selected.length === 0) return undefined;
   if (selected.length > MAX_INLINE_SKILL_COUNT) {
     throw new Error(`Inline skill expansion supports at most ${MAX_INLINE_SKILL_COUNT} distinct skills per message.`);
   }
 
   let totalBytes = 0;
-  const blocks: string[] = [];
+  const snapshots: InlineSkillSnapshot[] = [];
   for (const skill of selected) {
     if (typeof skill.filePath !== "string" || typeof skill.baseDir !== "string") {
       throw new Error(`Inline skill "$${skill.name}" has invalid registered resource metadata.`);
@@ -118,11 +132,37 @@ export function expandInlineSkillMentions(
     totalBytes += loaded.bytes;
 
     const body = stripFrontmatter(loaded.text).trim();
-    // Match the official SDK's `/skill:name` wrapper and resource-base wording.
-    blocks.push(
-      `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`,
-    );
+    snapshots.push({
+      name: skill.name,
+      filePath: skill.filePath,
+      baseDir: skill.baseDir,
+      body,
+    });
   }
 
-  return `${text}\n\n${blocks.join("\n\n")}`;
+  return { version: 1, requestId, skills: snapshots };
+}
+
+export function isInlineSkillContextSnapshot(value: unknown): value is InlineSkillContextSnapshot {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const snapshot = value as Partial<InlineSkillContextSnapshot>;
+  if (snapshot.version !== 1 || typeof snapshot.requestId !== "string" || !snapshot.requestId) return false;
+  if (!Array.isArray(snapshot.skills) || snapshot.skills.length === 0 || snapshot.skills.length > MAX_INLINE_SKILL_COUNT) return false;
+
+  let totalBytes = 0;
+  for (const skill of snapshot.skills) {
+    if (
+      typeof skill !== "object"
+      || skill === null
+      || typeof skill.name !== "string"
+      || typeof skill.filePath !== "string"
+      || typeof skill.baseDir !== "string"
+      || typeof skill.body !== "string"
+    ) return false;
+    const bytes = Buffer.byteLength(skill.body, "utf8");
+    if (bytes > MAX_INLINE_SKILL_BYTES) return false;
+    totalBytes += bytes;
+    if (totalBytes > MAX_INLINE_SKILL_TOTAL_BYTES) return false;
+  }
+  return true;
 }

@@ -36,6 +36,52 @@ For a Web message with recognized inline skill references, the system SHALL incl
 - **THEN** it can be loaded explicitly just as with `/skill:name`
 - **AND** this does not enable its automatic invocation
 
+### Requirement: User messages and skill context are separate
+
+For new inline-reference sends, the persisted user-authored text MUST equal the original request, without appended skill instructions. Registered name/path identities and the exact loaded instruction snapshots SHALL be retained separately and supplied as distinct model context without requiring an additional model-issued file read. The default transcript SHALL show the short request and compact references, not full instruction bodies. Copying or editing SHALL use the original request. Instruction inspection SHALL be opt-in. Ordinary unrelated math rendering MUST remain supported.
+
+#### Scenario: Short message with two loaded skills
+
+- **WHEN** a user submits `Use $alpha and $beta`
+- **THEN** the user message text remains exactly `Use $alpha and $beta` in persisted history and after browser refresh
+- **AND** the model receives the exact loaded alpha and beta instructions as separate context
+- **AND** the default user bubble does not display either instruction body
+- **AND** copy/edit returns only the original request
+
+#### Scenario: Expanded inline history remains readable
+
+- **WHEN** an existing session contains the previously generated request plus complete appended skill envelopes
+- **THEN** the interface shows a compact request with opt-in instruction disclosure and compact copy/edit
+- **AND** the persisted history is not rewritten
+- **AND** arbitrary malformed, code-quoted or lookalike user text is not silently removed
+
+### Requirement: Skill context delivery is bound to its request
+
+Loaded snapshots MUST remain associated with their originating request through queued delivery, cancellation, extension-handled or rejected input, reload, session reopen and branching. A failed or consumed submission MUST NOT leak instructions into a later unrelated request. Reconstructing an accepted request MUST NOT re-read changed skill files in place of its original snapshots. A new explicit submission SHALL use the current registered file content. Supported compaction MUST make retained instruction snapshots available to its summarization input and respect the SDK's context lifecycle rather than reconstructing snapshots from discarded or abandoned branches.
+
+#### Scenario: Concurrent queued requests stay separate
+
+- **WHEN** different steering and follow-up requests select different skills while a run is active
+- **THEN** each context snapshot is consumed alongside its originating request at the existing delivery boundary
+- **AND** no context snapshot is delivered early with another request
+
+#### Scenario: Rejected request cannot affect a later turn
+
+- **WHEN** a skill-bearing input is refused, cancelled before delivery, or consumed by an input extension
+- **THEN** a later unrelated request receives no orphaned instructions from it
+
+#### Scenario: Reopen retains the loaded snapshot
+
+- **WHEN** an accepted skill request is saved, its source file changes, and the session is reopened
+- **THEN** its retained context uses the original loaded snapshot rather than the changed file
+- **AND** a new explicit request can load the changed file
+
+#### Scenario: Compaction can summarize selected instructions
+
+- **WHEN** SDK compaction summarizes a request carrying a retained skill snapshot
+- **THEN** its summarization input includes the corresponding loaded instructions
+- **AND** subsequent ordinary requests do not reconstruct discarded snapshots from live files or abandoned branches
+
 ### Requirement: Skill resolution respects the current session
 
 The system MUST resolve names only through the current session's loaded skill resources and MUST NOT accept arbitrary paths from dollar text or the client as authority to read a file. It SHALL use refreshed resources after reload and the actual loaded resources on session resume. A recognized skill that cannot be read safely within documented size limits MUST produce a visible failure rather than silently omitting or truncating instructions.

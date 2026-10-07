@@ -49,10 +49,26 @@ export interface ToolCallContent {
 
 export type AssistantContentBlock = TextContent | ImageContent | ThinkingContent | ToolCallContent;
 
+export interface PiWebInlineSkillContextV1 {
+  version: 1;
+  requestId: string;
+  skills: Array<{
+    name: string;
+    filePath: string;
+    baseDir: string;
+    body: string;
+  }>;
+}
+
+export interface PiWebUserMessageMetadata {
+  inlineSkillContext?: PiWebInlineSkillContextV1;
+}
+
 export interface UserMessage {
   role: "user";
   content: string | (TextContent | ImageContent)[];
   timestamp?: number;
+  piWeb?: PiWebUserMessageMetadata;
 }
 
 export interface AgentUsage {

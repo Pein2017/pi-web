@@ -14,3 +14,10 @@
 - [x] 3.1 Qualify the actual browser composer to Web API/SDK terminal-consumer slice with test-owned fixtures and no paid model calls; retain evidence for two skills, deduplication, literals, queued modes and compatibility.
 - [x] 3.2 Run final full standalone tests, Web typecheck/lint, affected demo checks and strict OpenSpec validation; inspect final scoped diff and preserve unrelated/generated state.
 - [x] 3.3 Document usage, limits, ownership and acceptance evidence in this repository; distinguish local qualification from hosted CI, runtime deployment and private Codex APP parity.
+
+## 4. Correct compact messages and independent skill context
+
+- [x] 4.1 Implement durable per-request instruction snapshots and separate model-context delivery using public SDK integration; prove unchanged raw user text and fail-closed bounded loading with RED/GREEN checks.
+- [x] 4.2 Qualify request/context association through prompt, steer, follow-up, cancellation, handled/rejected input, reload, reopen and branch reconstruction; no orphaned or re-read historical instructions.
+- [x] 4.3 Add compact reference presentation, opt-in instruction inspection, short copy/edit and strict display-only compatibility for legacy appended history; retain math/slash/files/images and demo parity.
+- [x] 4.4 Qualify real browser/Web API/installed-SDK/provider input and persisted readback; run current standalone/static/demo checks and strict OpenSpec validation, then document corrected behavior and local evidence.

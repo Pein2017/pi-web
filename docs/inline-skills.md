@@ -18,10 +18,23 @@ submit it. Existing slash commands and `@` file completion remain separate.
 At send time, the Web session resolves names against **its loaded skill catalog**.
 It reads each recognized skill's instructions once per message, in first-reference
 order, preserving the registered location and relative-resource base directory.
-The original request remains present. Repeating `$name` does not inject another
-copy of that skill into the same message. The transcript preserves these dollar
-references as text instead of treating a pair as inline math; copying/editing and
-persisted input stay raw, and ordinary unrelated math still renders normally.
+The original request stays short and unchanged: generated instructions are not
+appended to user-authored text. The Web integration retains the registered
+name/path identities and loaded instruction snapshots separately in versioned
+`message.piWeb.inlineSkillContext` metadata. A public SDK context adapter supplies
+one distinct model-context message per selected skill immediately after the
+originating user message; the agent does not need to issue a second file read.
+
+The transcript shows the original request and compact skill references. Instruction
+bodies are inspectable on demand, not displayed by default. Copying/editing uses
+only the original request; images are retained. Repeating `$name` does not inject
+another copy into the same message. Skill dollars remain literal instead of
+becoming paired inline math, and ordinary unrelated math still renders normally.
+
+Existing inline-expanded history receives display-only compact restoration for
+complete recognized appended envelopes. Its stored text is not rewritten. Broken,
+code-quoted or nonmatching lookalikes remain ordinary text. Existing leading
+`/skill:name` display and SDK loading are unchanged.
 
 This applies to ordinary Web prompts and supported steering/follow-up messages,
 including sessions reopened or reloaded through the existing Web controls. Skill
@@ -52,9 +65,22 @@ non-Web subagents.
 Registered extension slash-command arguments are left to the command rather than
 rewritten as model input. The existing `/skill:name` input path remains available.
 
-The Web adapter runs before the SDK's normal input pipeline. Third-party input
-extensions can still intentionally handle or replace input through their existing
-public hooks; this feature does not override those extensions.
+The Web adapter preflights before the SDK's normal input pipeline. Snapshots travel
+with their actual originating user-message objects rather than in an independent
+context queue. Cancelled or consumed submissions must not leave instructions for
+a later unrelated request. Third-party input extensions can still intentionally
+handle or replace input through their existing public hooks; this feature does
+not override those extensions.
+
+Reload or a new explicit reference loads current registered files. Reopening a
+Web session instead projects its retained historical snapshots, so later edits
+to a skill file do not silently change what an old request means. Branch selection
+and compaction follow the SDK's retained context; discarded history is not
+resurrected by looking up live skill files.
+
+Compact display is not a token-saving claim. Full instructions still enter model
+context, whether loaded by the harness or through a model-issued read. This change
+deduplicates within each originating message, not across all future turns.
 
 ## Ownership and acceptance
 
@@ -63,10 +89,17 @@ not by a Pi Core fork or an external extension package. Its specification and ta
 record live under `openspec/changes/inline-multi-skill-mentions/`.
 
 The intended style is based on the inspected public Codex implementation, which
-supports multiple selected skill identities and instruction fragments. This is
+submits short text and selected name/path identities separately, then loads full
+instruction fragments in its backend. The Web representation uses a narrowly
+scoped public `Agent` method adapter and public SDK context extension, not a
+new Pi Core protocol. Native Pi CLI does not install this Web adapter and therefore
+does not automatically reproject the Web-specific stored snapshots; native-CLI
+model-context portability is outside this change.
+
+This supports multiple selected skill identities and instruction fragments. This is
 not a claim that Pi Web duplicates the private Codex APP frontend or protocol.
-See [local qualification](inline-skills-qualification.md) for the accepted test
-matrix and evidence. Publication, hosted CI and runtime deployment remain
+See [correction qualification](inline-skill-context-qualification.md) for the
+accepted compact-message, SDK lifecycle and browser test matrix and evidence. Publication, hosted CI and runtime deployment remain
 separate from local tests.
 
 The standalone browser smoke is `node e2e/inline-skills.mjs`. It requires the

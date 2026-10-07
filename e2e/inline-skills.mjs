@@ -1,9 +1,11 @@
 // Task 3.1: real browser composer -> Pi Web API -> installed SDK -> loopback fake provider.
 // Run with: node e2e/inline-skills.mjs
+// The task-authorized old-behavior RED control uses --baseline-93cc3c0.
 // The child process uses a sanitized environment and a private source snapshot. It
 // never builds or starts the active checkout's Next.js instance.
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, copyFileSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
@@ -12,9 +14,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const qualificationRoot = join(repoRoot, ".local/qualification/inline-skills");
-const browserCache = join(qualificationRoot, "browser-cache");
+const qualificationRoot = join(repoRoot, ".local/qualification/inline-skill-context");
+// Reuse the previously installed local browser binary without writing to its
+// older qualification evidence directory.
+const browserCache = join(repoRoot, ".local/qualification/inline-skills/browser-cache");
 const workerArg = "--isolated-worker";
+const baselineFlag = "--baseline-93cc3c0";
+const baselineRef = "93cc3c0";
 const MAX_SOURCE_BYTES = 200 * 1024 * 1024;
 const MAX_PROVIDER_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PROVIDER_CALLS = 12;
@@ -23,9 +29,12 @@ const MAIN_MARKER = "INLINE_SMOKE_MAIN_REQUEST";
 const STEER_MARKER = "INLINE_SMOKE_STEER_REQUEST";
 const FOLLOW_UP_MARKER = "INLINE_SMOKE_FOLLOW_UP_REQUEST";
 const NORMAL_MULTI_MARKER = "INLINE_SMOKE_NORMAL_MULTI_REQUEST";
+const LEGACY_MARKER = "INLINE_SMOKE_LEGACY_HISTORY";
+const LEGACY_SESSION_ID = "inline-skill-legacy-history";
 const ALPHA_BODY = "INLINE_SMOKE_ALPHA_BODY_SENTINEL";
 const BETA_BODY = "INLINE_SMOKE_BETA_BODY_SENTINEL";
 const GAMMA_BODY = "INLINE_SMOKE_GAMMA_BODY_SENTINEL";
+const INLINE_IMAGE_NAME = "inline-skill-context.png";
 const FAUX_REPLY = "INLINE_SKILLS_FAUX_PROVIDER_TERMINAL_OK";
 const MODEL_PROVIDER = "inline-smoke-local";
 const MODEL_ID = "inline-smoke-model";
@@ -66,7 +75,9 @@ function safeWorkerEnvironment() {
 }
 
 function startSanitizedWorker() {
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), workerArg], {
+  const args = [fileURLToPath(import.meta.url), workerArg];
+  if (process.argv.includes(baselineFlag)) args.push(baselineFlag);
+  const child = spawn(process.execPath, args, {
     cwd: repoRoot,
     env: safeWorkerEnvironment(),
     stdio: "inherit",
@@ -83,9 +94,25 @@ function startSanitizedWorker() {
   });
 }
 
+function gitBuffer(args, options = {}) {
+  return execFileSync("git", ["-C", repoRoot, ...args], {
+    encoding: "buffer",
+    maxBuffer: MAX_SOURCE_BYTES,
+    ...options,
+  });
+}
+
 function gitFiles(args) {
-  const output = execFileSync("git", ["-C", repoRoot, ...args], { encoding: "buffer", maxBuffer: 16 * 1024 * 1024 });
-  return output.toString("utf8").split("\0").filter(Boolean);
+  return gitBuffer(args).toString("utf8").split("\0").filter(Boolean);
+}
+
+function gitTreeEntries(ref) {
+  return gitBuffer(["ls-tree", "-r", "-z", ref]).toString("utf8").split("\0").filter(Boolean).map((record) => {
+    const tab = record.indexOf("\t");
+    assert.ok(tab > 0, `Malformed git tree entry for ${ref}`);
+    const [mode, type, oid] = record.slice(0, tab).split(" ");
+    return { mode, type, oid, path: record.slice(tab + 1) };
+  });
 }
 
 function isRuntimePath(path) {
@@ -122,29 +149,57 @@ function commonAncestor(paths) {
   return result;
 }
 
-function copyCandidateSnapshot(snapshotRoot, runDir) {
-  const tracked = gitFiles(["ls-files", "-z"]);
-  const untracked = gitFiles(["ls-files", "--others", "--exclude-standard", "-z"]);
-  const unexpected = untracked.filter(isRuntimePath).filter((path) => !isAllowedTaskUntracked(path));
-  assert.deepEqual(unexpected, [], `Refusing to snapshot unlisted untracked runtime source: ${unexpected.join(", ")}`);
-  const files = [...new Set([
-    ...tracked.filter(shouldCopyRuntimeFile),
-    ...untracked.filter(isAllowedTaskUntracked).filter(shouldCopyRuntimeFile),
-  ])].sort();
-  assert.ok(files.includes("next.config.ts"), "Candidate snapshot must contain next.config.ts");
-  assert.ok(files.includes("package.json"), "Candidate snapshot must contain package.json");
+function copyCandidateSnapshot(snapshotRoot, runDir, requestedBaseline = null) {
+  let files;
+  let totalBytes;
+  let baselineEntries;
+  if (requestedBaseline) {
+    assert.equal(requestedBaseline, baselineRef, "Only the task-authorized baseline may be selected");
+    baselineEntries = gitTreeEntries(requestedBaseline);
+    const runtimeEntries = baselineEntries.filter(({ path }) => shouldCopyRuntimeFile(path));
+    for (const entry of runtimeEntries) {
+      assert.ok(entry.type === "blob" && (entry.mode === "100644" || entry.mode === "100755"),
+        `Refusing non-regular baseline source entry: ${entry.path}`);
+    }
+    files = runtimeEntries.map(({ path }) => path).sort();
+    const sizes = execFileSync("git", ["-C", repoRoot, "cat-file", "--batch-check=%(objectname) %(objectsize)"], {
+      input: `${runtimeEntries.map(({ oid }) => oid).join("\n")}\n`,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    }).trim().split(/\r?\n/).map((line) => Number(line.split(" ").at(-1)));
+    assert.equal(sizes.length, runtimeEntries.length, "Baseline blob-size listing should align with runtime entries");
+    totalBytes = sizes.reduce((sum, size) => sum + size, 0);
+    assert.ok(totalBytes <= MAX_SOURCE_BYTES, `Baseline source snapshot exceeds ${MAX_SOURCE_BYTES} bytes: ${totalBytes}`);
+  } else {
+    const tracked = gitFiles(["ls-files", "-z"]);
+    const untracked = gitFiles(["ls-files", "--others", "--exclude-standard", "-z"]);
+    const unexpected = untracked.filter(isRuntimePath).filter((path) => !isAllowedTaskUntracked(path));
+    assert.deepEqual(unexpected, [], `Refusing to snapshot unlisted untracked runtime source: ${unexpected.join(", ")}`);
+    files = [...new Set([
+      ...tracked.filter(shouldCopyRuntimeFile),
+      ...untracked.filter(isAllowedTaskUntracked).filter(shouldCopyRuntimeFile),
+    ])].sort();
+    totalBytes = files.reduce((sum, path) => {
+      const entry = lstatSync(join(repoRoot, path));
+      assert.ok(entry.isFile(), `Refusing non-regular source snapshot entry: ${path}`);
+      return sum + entry.size;
+    }, 0);
+    assert.ok(totalBytes <= MAX_SOURCE_BYTES, `Candidate source snapshot exceeds ${MAX_SOURCE_BYTES} bytes: ${totalBytes}`);
+  }
+  assert.ok(files.includes("next.config.ts"), "Source snapshot must contain next.config.ts");
+  assert.ok(files.includes("package.json"), "Source snapshot must contain package.json");
 
-  const totalBytes = files.reduce((sum, path) => {
-    const entry = lstatSync(join(repoRoot, path));
-    assert.ok(entry.isFile(), `Refusing non-regular source snapshot entry: ${path}`);
-    return sum + entry.size;
-  }, 0);
-  assert.ok(totalBytes <= MAX_SOURCE_BYTES, `Candidate source snapshot exceeds ${MAX_SOURCE_BYTES} bytes: ${totalBytes}`);
+  const baselineByPath = new Map(baselineEntries?.map((entry) => [entry.path, entry]) ?? []);
   for (const path of files) {
-    const source = join(repoRoot, path);
     const destination = join(snapshotRoot, path);
     mkdirSync(dirname(destination), { recursive: true });
-    copyFileSync(source, destination);
+    if (requestedBaseline) {
+      const entry = baselineByPath.get(path);
+      assert.ok(entry, `Missing baseline blob for ${path}`);
+      writeFileSync(destination, gitBuffer(["cat-file", "blob", entry.oid]));
+    } else {
+      copyFileSync(join(repoRoot, path), destination);
+    }
   }
 
   const modulesPath = realpathSync(join(repoRoot, "node_modules"));
@@ -160,8 +215,15 @@ function copyCandidateSnapshot(snapshotRoot, runDir) {
   config = config.replaceAll(rootExpression, JSON.stringify(resolverRoot));
   writeFileSync(configPath, config);
 
+  const sourceHead = gitBuffer(["rev-parse", requestedBaseline ?? "HEAD"]).toString("utf8").trim();
+  const testScriptPath = fileURLToPath(import.meta.url);
+  const testScriptSha256 = createHash("sha256").update(readFileSync(testScriptPath)).digest("hex");
   writeFileSync(join(runDir, "source-manifest.json"), JSON.stringify({
-    repositoryHead: execFileSync("git", ["-C", repoRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    repositoryHead: sourceHead,
+    sourceMode: requestedBaseline ? "authorized-baseline" : "candidate-worktree",
+    requestedBaseline,
+    e2eScriptPath: testScriptPath,
+    e2eScriptSha256: testScriptSha256,
     copiedFiles: files,
     copiedBytes: totalBytes,
     nodeModulesSymlink: modulesPath,
@@ -169,7 +231,7 @@ function copyCandidateSnapshot(snapshotRoot, runDir) {
     fixtureOnlyTurbopackAndTracingRoot: resolverRoot,
     note: "No .local, .next, node_modules contents, docs, OpenSpec, or unrelated untracked files were copied.",
   }, null, 2));
-  return { resolverRoot, copiedFiles: files, copiedBytes: totalBytes };
+  return { resolverRoot, copiedFiles: files, copiedBytes: totalBytes, sourceHead, requestedBaseline, testScriptSha256 };
 }
 
 function reservePort() {
@@ -204,7 +266,7 @@ function messageText(message) {
     if (part && typeof part.text === "string") return part.text;
     if (part && typeof part.content === "string") return part.content;
     return "";
-  }).join("\n");
+  }).filter((text) => text.length > 0).join("\n");
 }
 
 function providerText(payload) {
@@ -215,6 +277,38 @@ function messageWithMarker(payload, marker) {
   return (Array.isArray(payload?.messages) ? payload.messages : [])
     .map(messageText)
     .find((text) => text.includes(marker)) ?? "";
+}
+
+function providerUserMessageIndex(messages, marker) {
+  const matches = [];
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role === "user" && messageText(message).includes(marker)) matches.push(index);
+  }
+  assert.equal(matches.length, 1, `provider request should contain one originating user message for ${marker}`);
+  return matches[0];
+}
+
+function skillContextMessagesAfter(messages, userIndex) {
+  const result = [];
+  for (let index = userIndex + 1; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role !== "user" || !messageText(message).startsWith('<skill name="')) break;
+    result.push(message);
+  }
+  return result;
+}
+
+function contextWrapper({ name, filePath, baseDir, body }) {
+  return `<skill name="${name}" location="${filePath}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
+}
+
+function expectedSkillMetadata(agentDir, name) {
+  const skillDir = join(agentDir, "skills", name);
+  const body = name === "alpha"
+    ? `${ALPHA_BODY}\nDocumentation-only token: $beta. It must not recursively include beta.`
+    : name === "beta" ? BETA_BODY : GAMMA_BODY;
+  return { name, filePath: join(skillDir, "SKILL.md"), baseDir: skillDir, body };
 }
 
 function count(text, needle) {
@@ -370,7 +464,7 @@ function seedFixtures(agentDir, workspace, providerPort) {
           id: MODEL_ID,
           name: "Inline Skills Loopback Fixture",
           reasoning: false,
-          input: ["text"],
+          input: ["text", "image"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 8192,
           maxTokens: 256,
@@ -378,6 +472,22 @@ function seedFixtures(agentDir, workspace, providerPort) {
       },
     },
   }, null, 2));
+  return seedLegacyHistory(agentDir, workspace);
+}
+
+function seedLegacyHistory(agentDir, workspace) {
+  const timestamp = "2026-10-11T00:00:00.000Z";
+  const prompt = `${LEGACY_MARKER}: legacy short prompt uses $beta and $alpha.`;
+  const legacyText = `${prompt}\n\n${contextWrapper(expectedSkillMetadata(agentDir, "beta"))}\n\n${contextWrapper(expectedSkillMetadata(agentDir, "alpha"))}`;
+  const sessionDir = join(agentDir, "sessions", "inline-skill-context");
+  mkdirSync(sessionDir, { recursive: true });
+  const entries = [
+    { type: "session", version: 3, id: LEGACY_SESSION_ID, timestamp, cwd: workspace },
+    { type: "message", id: "legacy-user", parentId: null, timestamp, message: { role: "user", content: legacyText } },
+  ];
+  const sessionFile = join(sessionDir, `${timestamp.replaceAll(":", "-")}_${LEGACY_SESSION_ID}.jsonl`);
+  writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  return { prompt, legacyText, sessionFile };
 }
 
 function seedNextFontMock(runDir) {
@@ -577,6 +687,7 @@ async function runSmoke() {
   let nextExit;
   let resolverRoot;
   let base;
+  let inlineImageBase64;
   let providerPort;
   let sessionId;
   let failed;
@@ -600,10 +711,17 @@ async function runSmoke() {
 
   try {
     if (pendingSignal) { evidence.status = "INTERRUPTED"; return; }
-    const snapshot = copyCandidateSnapshot(sourceRoot, runDir);
+    const requestedBaseline = process.argv.includes(baselineFlag) ? baselineRef : null;
+    const snapshot = copyCandidateSnapshot(sourceRoot, runDir, requestedBaseline);
     resolverRoot = snapshot.resolverRoot;
+    evidence.repositoryHead = snapshot.sourceHead;
+    evidence.sourceMode = requestedBaseline ? "authorized-baseline" : "candidate-worktree";
+    evidence.requestedBaseline = requestedBaseline;
+    evidence.e2eScriptSha256 = snapshot.testScriptSha256;
     providerPort = await listenLoopback(provider.server);
-    seedFixtures(agentDir, workspace, providerPort);
+    const legacyFixture = seedFixtures(agentDir, workspace, providerPort);
+    evidence.legacySessionId = LEGACY_SESSION_ID;
+    evidence.legacySessionFile = legacyFixture.sessionFile;
     const port = await reservePort();
     base = `http://127.0.0.1:${port}`;
     if (pendingSignal) { evidence.status = "INTERRUPTED"; return; }
@@ -657,8 +775,11 @@ async function runSmoke() {
 
     browser = await chromium.launch({ headless: true, executablePath: browserExecutable, timeout: 30_000, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
     context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US", serviceWorkers: "block" });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
     await context.addInitScript(() => {
-      if (location.origin.startsWith("http")) localStorage.setItem("pi-enter-send-mode", "enter");
+      if (!location.origin.startsWith("http")) return;
+      localStorage.setItem("pi-enter-send-mode", "enter");
+      localStorage.setItem("pi-locale", "en");
     });
     page = await context.newPage();
     page.setDefaultTimeout(15_000);
@@ -745,6 +866,9 @@ Fenced code:
 $beta
 \`\`\`
 Slash literal: /skill:alpha`;
+    const steerPrompt = `${STEER_MARKER}: $alpha before $beta and $alpha again queued`;
+    const followUpPrompt = `${FOLLOW_UP_MARKER}: $beta before $alpha queued`;
+    const normalMultiPrompt = `${NORMAL_MULTI_MARKER}: use $beta, $alpha and $beta. Math check: $x^2$.`;
     await textarea.fill(mainPrompt);
     const mainPost = observedWait(page.waitForRequest((request) => {
       if (request.method() !== "POST" || !request.url().includes(`/api/agent/${encodeURIComponent(sessionId)}`)) return false;
@@ -760,6 +884,17 @@ Slash literal: /skill:alpha`;
     ]);
     const mainTurnText = messageWithMarker(targetRequest.payload, MAIN_MARKER);
     assert.ok(mainTurnText.includes(MAIN_MARKER), "the actual Web prompt must reach the fake provider");
+    const initialProviderMessages = targetRequest.payload.messages;
+    const initialMainIndex = providerUserMessageIndex(initialProviderMessages, MAIN_MARKER);
+    assert.equal(messageText(initialProviderMessages[initialMainIndex]), mainPrompt,
+      "provider raw user content must stay exact; skill bodies belong in independent following context messages");
+    assert.deepEqual(skillContextMessagesAfter(initialProviderMessages, initialMainIndex).map(messageText),
+      [contextWrapper(expectedSkillMetadata(agentDir, "beta"))],
+      "only the live beta reference should project after the main raw user message");
+    const firstProviderText = providerText(targetRequest.payload);
+    assert.ok(!firstProviderText.includes(STEER_MARKER), "future steering input must not leak into the main provider snapshot");
+    assert.ok(!firstProviderText.includes(FOLLOW_UP_MARKER), "future follow-up input must not leak into the main provider snapshot");
+    assert.ok(!firstProviderText.includes(ALPHA_BODY), "future alpha skill context must not be projected before its originating queued message");
     const agentPath = `/api/agent/${encodeURIComponent(sessionId)}`;
     await waitUntil("the session entering streaming state", async () => {
       const response = await fetch(`${base}${agentPath}`, { signal: AbortSignal.timeout(5000) }).catch(() => null);
@@ -779,14 +914,12 @@ Slash literal: /skill:alpha`;
       } catch { return false; }
     }, { timeout: 30_000 }));
 
-    const steerPrompt = `${STEER_MARKER}: $alpha before $beta and $alpha again queued`;
     const steerResponse = waitForQueuedPost("steer");
     await textarea.fill(steerPrompt);
     await textarea.press("Enter");
     const steerResult = await steerResponse;
     assert.equal(steerResult.status(), 200, "steering input should be accepted by the real Web API");
 
-    const followUpPrompt = `${FOLLOW_UP_MARKER}: $beta before $alpha queued`;
     const followUpResponse = waitForQueuedPost("followUp");
     await textarea.fill(followUpPrompt);
     await textarea.press("Alt+Enter");
@@ -815,7 +948,6 @@ Slash literal: /skill:alpha`;
     }, 60_000);
 
     // Also close the ordinary, non-streaming two-skill case through the browser.
-    const normalMultiPrompt = `${NORMAL_MULTI_MARKER}: use $beta, $alpha and $beta.`;
     const normalResponse = observedWait(page.waitForResponse((response) => {
       try {
         const body = response.request().postDataJSON();
@@ -823,6 +955,43 @@ Slash literal: /skill:alpha`;
           && body?.type === "prompt" && body?.message === normalMultiPrompt;
       } catch { return false; }
     }));
+    const imageFixturePage = await context.newPage();
+    let imageFixtureBytes;
+    try {
+      await imageFixturePage.setContent(`<!doctype html><style>
+        html, body { margin: 0; padding: 0; }
+        #inline-smoke-image { width: 96px; height: 64px; display: grid; place-items: center; background: linear-gradient(135deg, #1d4ed8, #9333ea); color: white; font: 700 20px sans-serif; }
+      </style><div id="inline-smoke-image">PI WEB</div>`);
+      imageFixtureBytes = await imageFixturePage.locator("#inline-smoke-image").screenshot({ type: "png" });
+    } finally {
+      await imageFixturePage.close();
+    }
+    assert.ok(Buffer.isBuffer(imageFixtureBytes) && imageFixtureBytes.length > 100, "Playwright screenshot fixture should be a non-empty PNG");
+    assert.equal(imageFixtureBytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a", "image fixture should have the PNG signature");
+    assert.equal(imageFixtureBytes.toString("ascii", 12, 16), "IHDR", "image fixture should contain a PNG IHDR chunk");
+    const imageFixtureWidth = imageFixtureBytes.readUInt32BE(16);
+    const imageFixtureHeight = imageFixtureBytes.readUInt32BE(20);
+    assert.deepEqual([imageFixtureWidth, imageFixtureHeight], [96, 64], "image fixture should be a 96x64 screenshot");
+    const imageFixturePath = join(runDir, INLINE_IMAGE_NAME);
+    writeFileSync(imageFixturePath, imageFixtureBytes);
+    inlineImageBase64 = imageFixtureBytes.toString("base64");
+    evidence.imageFixture = {
+      path: imageFixturePath,
+      sha256: createHash("sha256").update(imageFixtureBytes).digest("hex"),
+      bytes: imageFixtureBytes.length,
+      width: imageFixtureWidth,
+      height: imageFixtureHeight,
+      generatedBy: "Playwright locator screenshot",
+    };
+
+    const imageInput = page.locator('input[type="file"][accept="image/*"]');
+    assert.equal(await imageInput.count(), 1, "the real composer image input should remain available");
+    await imageInput.setInputFiles({
+      name: INLINE_IMAGE_NAME,
+      mimeType: "image/png",
+      buffer: imageFixtureBytes,
+    });
+    await waitUntil("composer image preview", async () => await page.locator(".chat-input-shell img[src^='blob:']").count() > 0, 15_000);
     await textarea.fill(normalMultiPrompt);
     await textarea.press("Enter");
     assert.equal((await normalResponse).status(), 200, "ordinary multi-skill input should be accepted");
@@ -832,33 +1001,74 @@ Slash literal: /skill:alpha`;
     }, 60_000);
 
     const normalBubble = page.locator(".markdown-user-message").filter({ hasText: NORMAL_MULTI_MARKER });
-    assert.ok((await normalBubble.textContent()).includes(normalMultiPrompt), "rendered skill names must retain literal dollars, not become inline math");
-    assert.equal(await normalBubble.locator(".katex").count(), 0, "skill references are not math expressions");
+    const normalBubbleText = await normalBubble.textContent() ?? "";
+    assert.ok(normalBubbleText.includes(NORMAL_MULTI_MARKER) && normalBubbleText.includes("$beta") && normalBubbleText.includes("$alpha"),
+      "rendered skill references must retain literal dollars rather than become inline math");
+    assert.equal(await normalBubble.locator(".katex").count(), 1, "skill references stay literal while ordinary inline math still renders");
 
-    const turnExpectations = new Map([
-      [NORMAL_MULTI_MARKER, { alpha: 1, beta: 1, gamma: 0 }],
-      [MAIN_MARKER, { alpha: 0, beta: 1, gamma: 0 }],
-      [STEER_MARKER, { alpha: 1, beta: 1, gamma: 0 }],
-      [FOLLOW_UP_MARKER, { alpha: 1, beta: 1, gamma: 0 }],
+    const rawPromptByMarker = new Map([
+      [MAIN_MARKER, mainPrompt],
+      [NORMAL_MULTI_MARKER, normalMultiPrompt],
+      [STEER_MARKER, steerPrompt],
+      [FOLLOW_UP_MARKER, followUpPrompt],
     ]);
-    const turnMessages = new Map();
-    for (const { payload } of provider.requests) {
-      for (const marker of turnExpectations.keys()) {
-        if (turnMessages.has(marker)) continue;
-        const text = messageWithMarker(payload, marker);
-        if (text) turnMessages.set(marker, text);
+    const skillNamesByMarker = new Map([
+      [MAIN_MARKER, ["beta"]],
+      [NORMAL_MULTI_MARKER, ["beta", "alpha"]],
+      [STEER_MARKER, ["alpha", "beta"]],
+      [FOLLOW_UP_MARKER, ["beta", "alpha"]],
+    ]);
+    for (const [marker, rawPrompt] of rawPromptByMarker) {
+      const apiMatches = evidence.apiCommands.filter(({ body }) => body.message?.includes(marker));
+      assert.equal(apiMatches.length, 1, `${marker} should have one original browser API command`);
+      assert.equal(apiMatches[0].body.message, rawPrompt, `${marker} Web API command should preserve the exact raw user text`);
+
+      const bubble = page.locator(".markdown-user-message").filter({ hasText: marker }).last();
+      const visibleText = await bubble.textContent() ?? "";
+      for (const body of [ALPHA_BODY, BETA_BODY, GAMMA_BODY]) {
+        assert.ok(!visibleText.includes(body), `${marker} default user bubble must not reveal a skill body`);
+      }
+      const metadataPanel = page.locator('[data-skill-context="metadata"]').filter({ hasText: marker });
+      assert.equal(await metadataPanel.count(), 1, `${marker} UI should recover its compact metadata reference block`);
+      const compactText = await metadataPanel.textContent() ?? "";
+      for (const name of skillNamesByMarker.get(marker)) {
+        assert.ok(compactText.includes(`$${name}`), `${marker} compact references should show $${name}`);
       }
     }
-    assert.deepEqual([...turnMessages.keys()].sort(), [...turnExpectations.keys()].sort(), "main, steering and follow-up user messages should all reach the SDK consumer despite repeated history");
-    for (const marker of [NORMAL_MULTI_MARKER, STEER_MARKER, FOLLOW_UP_MARKER]) {
-      const turnText = turnMessages.get(marker);
-      assert.equal(count(turnText, ALPHA_BODY), 1, `${marker} should expand alpha once within its own user message`);
-      assert.equal(count(turnText, BETA_BODY), 1, `${marker} should expand beta once within its own user message`);
-      assert.equal(count(turnText, GAMMA_BODY), 0, `${marker} should not expand the literal-only gamma skill`);
+
+    const providerRecordByMarker = new Map();
+    for (const record of provider.requests) {
+      const messages = record.payload.messages;
+      for (const [marker, rawPrompt] of rawPromptByMarker) {
+        if (!messages.some((message) => message?.role === "user" && messageText(message).includes(marker))) continue;
+        const userIndex = providerUserMessageIndex(messages, marker);
+        const userMessage = messages[userIndex];
+        assert.equal(messageText(userMessage), rawPrompt,
+          `${marker} provider user message must remain raw; skill instructions belong in following independent context messages`);
+        const expectedContexts = skillNamesByMarker.get(marker)
+          .map((name) => contextWrapper(expectedSkillMetadata(agentDir, name)));
+        const actualContexts = skillContextMessagesAfter(messages, userIndex);
+        assert.deepEqual(actualContexts.map(messageText), expectedContexts,
+          `${marker} should be followed immediately by one full skill context message per referenced skill, in first-reference order`);
+        assert.ok(actualContexts.every((message) => message.role === "user"),
+          `${marker} skill contexts must use the SDK's provider user-message serialization`);
+        for (const name of skillNamesByMarker.get(marker)) {
+          const body = expectedSkillMetadata(agentDir, name).body;
+          assert.equal(count(actualContexts.map(messageText).join("\n"), body), 1,
+            `${marker} should project ${name}'s full body once within its own origin group`);
+        }
+        if (!providerRecordByMarker.has(marker)) providerRecordByMarker.set(marker, record);
+      }
     }
-    assert.ok(turnMessages.get(STEER_MARKER).indexOf(ALPHA_BODY) < turnMessages.get(STEER_MARKER).indexOf(BETA_BODY), "steer skill bodies should follow first-reference order");
-    assert.ok(turnMessages.get(FOLLOW_UP_MARKER).indexOf(BETA_BODY) < turnMessages.get(FOLLOW_UP_MARKER).indexOf(ALPHA_BODY), "follow-up skill bodies should follow first-reference order");
-    assert.ok(turnMessages.get(NORMAL_MULTI_MARKER).indexOf(BETA_BODY) < turnMessages.get(NORMAL_MULTI_MARKER).indexOf(ALPHA_BODY), "ordinary multi-skill input should retain first-reference order");
+    assert.deepEqual([...providerRecordByMarker.keys()].sort(), [...rawPromptByMarker.keys()].sort(),
+      "each main/steer/follow-up/ordinary prompt must reach the installed SDK provider");
+    const normalApiCommand = evidence.apiCommands.find(({ body }) => body.message === normalMultiPrompt);
+    assert.deepEqual(normalApiCommand?.body.images?.map(({ data, mimeType }) => ({ data, mimeType })),
+      [{ data: inlineImageBase64, mimeType: "image/png" }],
+      "the real Web API must retain the attached image alongside the exact raw text");
+    const normalProviderRecord = providerRecordByMarker.get(NORMAL_MULTI_MARKER);
+    assert.ok(JSON.stringify(normalProviderRecord?.payload.messages).includes(inlineImageBase64),
+      "the installed SDK provider request must receive the attached image payload");
     assert.ok(provider.failures.length === 0, `fake provider errors: ${provider.failures.join("; ")}`);
 
     const sessionResponse = await fetch(`${base}/api/sessions/${encodeURIComponent(sessionId)}?deferThinking=1&deferMedia=1`);
@@ -868,18 +1078,40 @@ Slash literal: /skill:alpha`;
     for (const marker of [MAIN_MARKER, NORMAL_MULTI_MARKER, STEER_MARKER, FOLLOW_UP_MARKER, FAUX_REPLY]) {
       assert.ok(transcript.includes(marker), `terminal transcript should contain ${marker}`);
     }
-    assert.deepEqual(evidence.browserErrors, [], `browser errors: ${evidence.browserErrors.join("; ")}`);
 
-    const mainSkillTurn = turnMessages.get(MAIN_MARKER);
-    assert.deepEqual({
-      alpha: count(mainSkillTurn, ALPHA_BODY),
-      beta: count(mainSkillTurn, BETA_BODY),
-      gamma: count(mainSkillTurn, GAMMA_BODY),
-    }, { alpha: 0, beta: 1, gamma: 0 }, "list-contained fence must keep alpha/gamma literal while the following live beta reference expands once");
-    assert.ok(mainSkillTurn.includes(join(agentDir, "skills/beta")), "beta's registered location should reach the consumer");
-    for (const skill of ["alpha", "gamma"]) {
-      assert.ok(!mainSkillTurn.includes(join(agentDir, `skills/${skill}`)), `${skill} must remain literal-only in the main message`);
+    const sessionsRoot = `${resolve(join(agentDir, "sessions"))}${sep}`;
+    const persistedSessionPath = resolve(sessionBody.filePath ?? "");
+    assert.ok(persistedSessionPath.startsWith(sessionsRoot), "session detail should point to this smoke's private persisted session file");
+    const persistedEntries = readFileSync(persistedSessionPath, "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => safeJson(line, "persisted SDK session entry"));
+    const persistedUserEntries = persistedEntries
+      .filter((entry) => entry?.type === "message" && entry.message?.role === "user");
+    const persistedEntryByMarker = new Map();
+    for (const [marker, rawPrompt] of rawPromptByMarker) {
+      const matches = persistedUserEntries.filter((entry) => messageText(entry.message).includes(marker));
+      assert.equal(matches.length, 1, `${marker} should persist as exactly one user message`);
+      const entry = matches[0];
+      assert.equal(messageText(entry.message), rawPrompt, `${marker} persisted user content must remain the exact raw text`);
+      const inlineContext = entry.message.piWeb?.inlineSkillContext;
+      assert.equal(inlineContext?.version, 1, `${marker} persisted message should carry inline-skill context version 1`);
+      assert.equal(typeof inlineContext?.requestId, "string", `${marker} persisted inline-skill context should have a requestId`);
+      assert.ok(inlineContext.requestId.trim(), `${marker} persisted inline-skill context requestId should not be empty`);
+      const expectedSkills = skillNamesByMarker.get(marker).map((name) => expectedSkillMetadata(agentDir, name));
+      assert.deepEqual(inlineContext.skills?.map(({ name, filePath, baseDir, body }) => ({ name, filePath, baseDir, body })),
+        expectedSkills, `${marker} persisted context metadata should contain the selected full skill snapshots in reference order`);
+      persistedEntryByMarker.set(marker, entry);
     }
+    const normalPersistedMessage = persistedEntryByMarker.get(NORMAL_MULTI_MARKER).message;
+    assert.ok(JSON.stringify(normalPersistedMessage.content).includes(inlineImageBase64),
+      "the persisted user message should retain its actual image block alongside the exact raw text");
+    evidence.persistedSessionFile = persistedSessionPath;
+    evidence.persistedRawUserMessageCount = persistedUserEntries.length;
+    const mainProviderRecord = providerRecordByMarker.get(MAIN_MARKER);
+    const mainProviderMessage = mainProviderRecord.payload.messages[providerUserMessageIndex(mainProviderRecord.payload.messages, MAIN_MARKER)];
+    assert.equal(messageText(mainProviderMessage), mainPrompt,
+      "the original main user content must contain every literal unchanged, with no skill wrapper appended");
     for (const literal of [
       "$unknown",
       String.raw`\$alpha`,
@@ -892,7 +1124,114 @@ Slash literal: /skill:alpha`;
       "Use $beta, then $beta.",
       "```text\n$beta\n```",
       "/skill:alpha",
-    ]) assert.ok(mainSkillTurn.includes(literal), `original literal should remain in the model input: ${JSON.stringify(literal)}`);
+    ]) assert.ok(messageText(mainProviderMessage).includes(literal), `original literal should remain in the raw provider user message: ${JSON.stringify(literal)}`);
+
+    const normalContextPanel = page.locator('[data-skill-context="metadata"]').filter({ hasText: NORMAL_MULTI_MARKER }).last();
+    const showSkillButton = normalContextPanel.locator('button[aria-expanded="false"]:not([aria-haspopup])');
+    assert.equal(await showSkillButton.getAttribute("aria-expanded"), "false", "new skill metadata should start collapsed");
+    await page.screenshot({ path: join(runDir, "inline-skill-metadata-compact.png"), fullPage: true });
+    await showSkillButton.click();
+    assert.equal(await normalContextPanel.locator('button[aria-expanded="true"]:not([aria-haspopup])').count(), 1, "opt-in button should expose its expanded state");
+    const expandedContextText = await normalContextPanel.textContent() ?? "";
+    const normalizedExpandedContextText = expandedContextText.replace(/\s+/g, "");
+    for (const name of skillNamesByMarker.get(NORMAL_MULTI_MARKER)) {
+      const skill = expectedSkillMetadata(agentDir, name);
+      assert.ok(expandedContextText.includes(skill.filePath), `opt-in disclosure should show ${name}'s exact loaded path`);
+      assert.ok(normalizedExpandedContextText.includes(skill.body.replace(/\s+/g, "")),
+        `opt-in disclosure should show ${name}'s full snapshotted body`);
+    }
+    assert.ok(expandedContextText.indexOf(expectedSkillMetadata(agentDir, "beta").filePath)
+      < expandedContextText.indexOf(expectedSkillMetadata(agentDir, "alpha").filePath),
+    "opt-in skill metadata should retain first-reference order");
+    await page.screenshot({ path: join(runDir, "inline-skill-metadata-expanded.png"), fullPage: true });
+    await normalContextPanel.locator('button[aria-expanded="true"]:not([aria-haspopup])').click();
+    assert.equal(await normalContextPanel.locator('button[aria-expanded="false"]:not([aria-haspopup])').count(), 1);
+
+    await waitUntil("active session URL binding", async () => new URL(page.url()).searchParams.get("session") === sessionId, 15_000);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const refreshedContextPanel = page.locator('[data-skill-context="metadata"]').filter({ hasText: NORMAL_MULTI_MARKER }).last();
+    await refreshedContextPanel.waitFor({ state: "visible" });
+    const refreshedText = await refreshedContextPanel.textContent() ?? "";
+    assert.ok(refreshedText.includes(NORMAL_MULTI_MARKER) && refreshedText.includes("$beta") && refreshedText.includes("$alpha"),
+      "browser refresh should recover the raw prompt and compact skill references");
+    for (const body of [ALPHA_BODY, BETA_BODY, GAMMA_BODY]) {
+      assert.ok(!refreshedText.includes(body), "browser refresh should restore skill disclosures in their compact default state");
+    }
+    assert.equal(await refreshedContextPanel.locator('button[aria-expanded="false"]:not([aria-haspopup])').count(), 1,
+      "refreshed metadata should remain opt-in");
+    const refreshedImage = refreshedContextPanel.locator("img");
+    await refreshedImage.waitFor({ state: "visible" });
+    assert.ok((await refreshedImage.getAttribute("src"))?.includes(inlineImageBase64), "browser refresh should recover the persisted image attachment");
+    const refreshedSessionResponse = await fetch(`${base}/api/sessions/${encodeURIComponent(sessionId)}?force=1&deferThinking=1&deferMedia=1`);
+    assert.equal(refreshedSessionResponse.status, 200, "forced session refresh should reread persisted user context through the real Web API");
+    const refreshedSessionBody = await refreshedSessionResponse.json();
+    assert.ok(JSON.stringify(refreshedSessionBody.context?.messages ?? []).includes(NORMAL_MULTI_MARKER),
+      "refreshed Web API transcript should contain the compact raw user prompt");
+    evidence.browserRefreshStatus = refreshedSessionResponse.status;
+    await page.screenshot({ path: join(runDir, "inline-skill-refresh-compact.png"), fullPage: true });
+
+    const normalMessageCard = refreshedContextPanel.locator('xpath=ancestor::div[.//button[@title="Copy message"]][1]');
+    await normalMessageCard.hover();
+    const copyButton = normalMessageCard.getByTitle("Copy message");
+    assert.equal(await copyButton.count(), 1, "the targeted user message should expose its own copy action");
+    await copyButton.click();
+    await waitUntil("raw user prompt copied without skill bodies", async () => {
+      try { return await page.evaluate(() => navigator.clipboard.readText()) === normalMultiPrompt; }
+      catch { return false; }
+    }, 10_000);
+    evidence.copiedUserText = await page.evaluate(() => navigator.clipboard.readText());
+    assert.equal(evidence.copiedUserText, normalMultiPrompt, "copy should contain only the original short user text, not skill bodies");
+
+    const editButton = normalMessageCard.getByTitle("Edit from here — branches within this session");
+    assert.equal(await editButton.count(), 1, "the target user message should expose its edit action");
+    await editButton.click();
+    assert.equal(await textarea.inputValue(), normalMultiPrompt, "edit should restore only the original raw user text");
+    assert.ok(!(await textarea.inputValue()).includes(ALPHA_BODY), "edit text must not contain skill instructions");
+    await waitUntil("edited composer restoring the attached image", async () => {
+      try {
+        return await page.locator(".chat-input-shell img").evaluateAll((images, base64) =>
+          images.some((image) => image.getAttribute("src")?.includes(base64)), inlineImageBase64);
+      } catch { return false; }
+    }, 15_000);
+    const cancelEdit = normalMessageCard.getByTitle("Cancel");
+    await cancelEdit.click();
+    await textarea.fill("");
+    evidence.editedUserText = normalMultiPrompt;
+
+    const legacyResponse = await fetch(`${base}/api/sessions/${encodeURIComponent(LEGACY_SESSION_ID)}?deferThinking=1&deferMedia=1`);
+    assert.equal(legacyResponse.status, 200, "seeded legacy history should load through the real session API");
+    const legacyBody = await legacyResponse.json();
+    const legacyUserMessage = (legacyBody.context?.messages ?? []).find((message) => message.role === "user" && messageText(message).includes(LEGACY_MARKER));
+    assert.ok(legacyUserMessage, "legacy session API should expose the appended historical prompt");
+    const legacyEntries = readFileSync(legacyFixture.sessionFile, "utf8").split(/\r?\n/).filter(Boolean)
+      .map((line) => safeJson(line, "legacy fixture session entry"));
+    const legacyEntry = legacyEntries.find((entry) => entry.type === "message" && entry.message?.role === "user");
+    assert.equal(legacyEntry?.message?.content, legacyFixture.legacyText, "legacy fixture should retain its historical appended user text");
+    assert.equal(legacyEntry?.message?.piWeb?.inlineSkillContext, undefined, "legacy fixture should have no new metadata envelope");
+    await page.goto(`${base}/?session=${encodeURIComponent(LEGACY_SESSION_ID)}`, { waitUntil: "domcontentloaded" });
+    const legacyPanel = page.locator('[data-skill-context="legacy-appended"]').filter({ hasText: LEGACY_MARKER }).last();
+    await legacyPanel.waitFor({ state: "visible" });
+    const legacyCompactText = await legacyPanel.textContent() ?? "";
+    assert.ok(legacyCompactText.includes(LEGACY_MARKER) && legacyCompactText.includes("$beta") && legacyCompactText.includes("$alpha"),
+      "legacy appended history should recover its compact raw prompt and skill names");
+    for (const body of [ALPHA_BODY, BETA_BODY]) {
+      assert.ok(!legacyCompactText.includes(body), "legacy appended history must not reveal skill bodies by default");
+    }
+    await page.screenshot({ path: join(runDir, "legacy-skill-history-compact.png"), fullPage: true });
+    const legacyShow = legacyPanel.locator('button[aria-expanded="false"]:not([aria-haspopup])');
+    assert.equal(await legacyShow.getAttribute("aria-expanded"), "false");
+    await legacyShow.click();
+    const legacyExpandedText = await legacyPanel.textContent() ?? "";
+    const normalizedLegacyExpandedText = legacyExpandedText.replace(/\s+/g, "");
+    for (const name of ["beta", "alpha"]) {
+      const skill = expectedSkillMetadata(agentDir, name);
+      assert.ok(legacyExpandedText.includes(skill.filePath), `legacy opt-in disclosure should show ${name}'s original path`);
+      assert.ok(normalizedLegacyExpandedText.includes(skill.body.replace(/\s+/g, "")),
+        `legacy opt-in disclosure should show ${name}'s full appended body`);
+    }
+    await page.screenshot({ path: join(runDir, "legacy-skill-history-expanded.png"), fullPage: true });
+    await legacyPanel.locator('button[aria-expanded="true"]:not([aria-haspopup])').click();
+    assert.deepEqual(evidence.browserErrors, [], `browser errors: ${evidence.browserErrors.join("; ")}`);
 
     await page.screenshot({ path: join(runDir, "terminal.png"), fullPage: true });
     evidence.status = "PASS";
@@ -900,7 +1239,7 @@ Slash literal: /skill:alpha`;
     evidence.apiPromptCommands = evidence.apiCommands;
     evidence.transcriptStatus = sessionResponse.status;
     evidence.completedAt = new Date().toISOString();
-    console.log(`PASS: browser completion, real Web API, SDK expansion/dedup, literal preservation, steer/followUp, terminal transcript (${provider.requests.length} fake-provider request(s))`);
+    console.log(`PASS: browser completion, raw persistence, independent SDK skill contexts, queued association, compact/opt-in UI, refresh, copy/edit, images and legacy history (${provider.requests.length} fake-provider request(s))`);
   } catch (error) {
     failed = error;
     evidence.failure = error instanceof Error ? { message: error.message, stack: error.stack } : String(error);

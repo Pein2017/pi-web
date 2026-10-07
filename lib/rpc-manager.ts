@@ -1,14 +1,16 @@
 // Attach metadata tracing to live dev servers too; the observer guards preload/HMR duplicates.
 import "../bin/proxy-observation.cjs";
 import { assertSharedPiWorkAdmission } from "./shared-pi-update.cjs";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage as PiAgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
-import { expandInlineSkillMentions } from "./inline-skill-expansion";
+import { snapshotInlineSkillMentions, type InlineSkillContextSnapshot } from "./inline-skill-expansion";
+import { createInlineSkillContextExtension } from "./inline-skill-context";
 import { invalidateModelsCache } from "./models-cache";
 import { hostRequestDiagnostics } from "./request-diagnostics";
 import { installRequestDiagnostics } from "./request-diagnostic-observer";
@@ -285,6 +287,11 @@ export function resolveActiveToolNames(
 // Wraps AgentSession with the same interface the rest of the app expects
 // ============================================================================
 
+type InlineSkillReservation = {
+  snapshot: InlineSkillContextSnapshot;
+  sessionPromptClaimed: boolean;
+};
+
 export class AgentSessionWrapper {
   // A Set, not an array: an SSE stream unsubscribes from inside emit() when it
   // closes on session_shutdown, and splicing an array mid-iteration made the
@@ -314,6 +321,20 @@ export class AgentSessionWrapper {
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
   private readonly enableInlineSkillExpansion: boolean;
+  private readonly inlineSkillReservation = new AsyncLocalStorage<InlineSkillReservation | null>();
+  private inlineSkillSessionPromptBoundary?: {
+    original: AgentSessionLike["prompt"];
+    wrapped: AgentSessionLike["prompt"];
+  };
+  private inlineSkillAgentBoundary?: {
+    agent: AgentSessionLike["agent"];
+    originalPrompt: NonNullable<AgentSessionLike["agent"]["prompt"]>;
+    originalSteer: NonNullable<AgentSessionLike["agent"]["steer"]>;
+    originalFollowUp: NonNullable<AgentSessionLike["agent"]["followUp"]>;
+    wrappedPrompt: NonNullable<AgentSessionLike["agent"]["prompt"]>;
+    wrappedSteer: NonNullable<AgentSessionLike["agent"]["steer"]>;
+    wrappedFollowUp: NonNullable<AgentSessionLike["agent"]["followUp"]>;
+  };
   private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
   private mcpHostDisposed = false;
   private requestDiagnosticsDisposer?: () => void;
@@ -344,6 +365,7 @@ export class AgentSessionWrapper {
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.enableInlineSkillExpansion = options.enableInlineSkillExpansion ?? false;
     this.mcpHost = options.mcpHost;
+    this.installInlineSkillAgentBoundary();
     this.requestDiagnosticsDisposer = options.disposeRequestDiagnostics;
   }
 
@@ -621,8 +643,8 @@ export class AgentSessionWrapper {
     }
   }
 
-  private prepareInlineSkillMessage(message: string): string {
-    if (!this.enableInlineSkillExpansion || !this.inner.resourceLoader || !message.includes("$")) return message;
+  private prepareInlineSkillContext(message: string): InlineSkillContextSnapshot | undefined {
+    if (!this.enableInlineSkillExpansion || !this.inner.resourceLoader || !message.includes("$")) return undefined;
     // Pi recognizes extension commands from the unexpanded first token. Keep
     // their arguments byte-for-byte unchanged, including any `$skill` text.
     if (message.startsWith("/")) {
@@ -630,14 +652,153 @@ export class AgentSessionWrapper {
       const commandName = spaceIndex === -1 ? message.slice(1) : message.slice(1, spaceIndex);
       try {
         if (this.inner.extensionRunner.getRegisteredCommands().some((command) => command.invocationName === commandName)) {
-          return message;
+          return undefined;
         }
       } catch {
         // If command ownership cannot be established, preserve slash semantics.
-        return message;
+        return undefined;
       }
     }
-    return expandInlineSkillMentions(message, this.inner.resourceLoader.getSkills().skills);
+    return snapshotInlineSkillMentions(message, this.inner.resourceLoader.getSkills().skills, randomUUID());
+  }
+
+  private assertInlineSkillAgentBoundary(snapshot: InlineSkillContextSnapshot | undefined): void {
+    if (!snapshot) return;
+    if (!this.inlineSkillSessionPromptBoundary || !this.inlineSkillAgentBoundary) {
+      throw new Error("Cannot submit a recognized inline skill: the public SDK user-message boundary is unavailable.");
+    }
+  }
+
+  private runInlineSkillRequest<T>(
+    snapshot: InlineSkillContextSnapshot | undefined,
+    action: () => T,
+  ): T {
+    return this.inlineSkillReservation.run(
+      snapshot ? { snapshot, sessionPromptClaimed: false } : null,
+      action,
+    );
+  }
+
+  private installInlineSkillAgentBoundary(): void {
+    if (!this.enableInlineSkillExpansion || this.inlineSkillAgentBoundary) return;
+    const agent = this.inner.agent;
+    const originalSessionPrompt = this.inner.prompt;
+    const session = this.inner;
+    const reservationStorage = this.inlineSkillReservation;
+    const wrappedSessionPrompt: AgentSessionLike["prompt"] = function (text, options) {
+      if (options?.source === "extension") {
+        return reservationStorage.run(null, () => originalSessionPrompt.call(session, text, options));
+      }
+      const reservation = reservationStorage.getStore();
+      if (!reservation) return originalSessionPrompt.call(session, text, options);
+      if (reservation.sessionPromptClaimed) {
+        return reservationStorage.run(null, () => originalSessionPrompt.call(session, text, options));
+      }
+      reservation.sessionPromptClaimed = true;
+      return originalSessionPrompt.call(session, text, options);
+    };
+    this.inner.prompt = wrappedSessionPrompt;
+    this.inlineSkillSessionPromptBoundary = {
+      original: originalSessionPrompt,
+      wrapped: wrappedSessionPrompt,
+    };
+
+    const originalPrompt = agent.prompt;
+    const originalSteer = agent.steer;
+    const originalFollowUp = agent.followUp;
+    if (!originalPrompt || !originalSteer || !originalFollowUp) {
+      this.restoreInlineSkillAgentBoundary();
+      return;
+    }
+
+    const attach = (message: PiAgentMessage, snapshot: InlineSkillContextSnapshot): PiAgentMessage => {
+      if (message.role !== "user") {
+        throw new Error("Cannot attach an inline skill snapshot to a non-user SDK message.");
+      }
+      const current = message as PiAgentMessage & { piWeb?: Record<string, unknown> };
+      return {
+        ...message,
+        piWeb: { ...current.piWeb, inlineSkillContext: snapshot },
+      } as PiAgentMessage;
+    };
+    type AgentPromptInput = string | PiAgentMessage | PiAgentMessage[];
+    const attachInput = (
+      input: AgentPromptInput,
+      snapshot: InlineSkillContextSnapshot,
+    ): AgentPromptInput => {
+      if (Array.isArray(input)) {
+        const index = input.findIndex((message) => message.role === "user");
+        if (index < 0) throw new Error("Cannot attach an inline skill snapshot: the SDK prompt has no user message.");
+        const copy = input.slice();
+        const message = copy[index];
+        if (!message) return input;
+        copy[index] = attach(message, snapshot);
+        return copy;
+      }
+      if (typeof input === "string") {
+        throw new Error("Cannot attach an inline skill snapshot to a string-only SDK prompt.");
+      }
+      return attach(input, snapshot);
+    };
+
+    const invokeOriginalPrompt = originalPrompt as unknown as (
+      input: AgentPromptInput,
+      images?: Parameters<NonNullable<AgentSessionLike["agent"]["prompt"]>>[1],
+    ) => Promise<void>;
+    const callOriginalPrompt = (input: AgentPromptInput, images?: Parameters<NonNullable<AgentSessionLike["agent"]["prompt"]>>[1]) =>
+      invokeOriginalPrompt.call(agent, input, images);
+    const reservation = this.inlineSkillReservation;
+    const wrappedPrompt = function (input: AgentPromptInput, images?: Parameters<NonNullable<AgentSessionLike["agent"]["prompt"]>>[1]) {
+      const current = reservation.getStore();
+      if (!current) return callOriginalPrompt(input, images);
+      return reservation.run(null, () => callOriginalPrompt(attachInput(input, current.snapshot), images));
+    } as typeof originalPrompt;
+    const wrappedSteer: typeof originalSteer = function (message) {
+      const current = reservation.getStore();
+      if (!current) return originalSteer.call(agent, message);
+      return reservation.run(null, () => originalSteer.call(agent, attach(message, current.snapshot)));
+    };
+    const wrappedFollowUp: typeof originalFollowUp = function (message) {
+      const current = reservation.getStore();
+      if (!current) return originalFollowUp.call(agent, message);
+      return reservation.run(null, () => originalFollowUp.call(agent, attach(message, current.snapshot)));
+    };
+
+    agent.prompt = wrappedPrompt;
+    agent.steer = wrappedSteer;
+    agent.followUp = wrappedFollowUp;
+    this.inlineSkillAgentBoundary = {
+      agent,
+      originalPrompt,
+      originalSteer,
+      originalFollowUp,
+      wrappedPrompt,
+      wrappedSteer,
+      wrappedFollowUp,
+    };
+  }
+
+  private restoreInlineSkillAgentBoundary(): void {
+    const sessionBoundary = this.inlineSkillSessionPromptBoundary;
+    if (sessionBoundary) {
+      if (this.inner.prompt === sessionBoundary.wrapped) this.inner.prompt = sessionBoundary.original;
+      this.inlineSkillSessionPromptBoundary = undefined;
+    }
+    const boundary = this.inlineSkillAgentBoundary;
+    if (!boundary) return;
+    if (boundary.agent.prompt === boundary.wrappedPrompt) boundary.agent.prompt = boundary.originalPrompt;
+    if (boundary.agent.steer === boundary.wrappedSteer) boundary.agent.steer = boundary.originalSteer;
+    if (boundary.agent.followUp === boundary.wrappedFollowUp) boundary.agent.followUp = boundary.originalFollowUp;
+    this.inlineSkillAgentBoundary = undefined;
+  }
+
+  private async reloadInnerSession(options?: Parameters<AgentSessionLike["reload"]>[0]): Promise<void> {
+    this.restoreInlineSkillAgentBoundary();
+    try {
+      await this.inner.reload(options);
+    } finally {
+      this.installInlineSkillAgentBoundary();
+    }
   }
 
   private async acquirePromptAdmission(): Promise<() => void> {
@@ -859,13 +1020,16 @@ export class AgentSessionWrapper {
             }
           }
           let promptMessage: string;
+          let inlineSkillContext: InlineSkillContextSnapshot | undefined;
           try {
             // The session catalog is sampled only after serialized admission and
             // after classification of the original command above. A concurrent
             // reload therefore cannot mix two resource catalogs in one send.
-            promptMessage = typeof command.message === "string"
-              ? this.prepareInlineSkillMessage(command.message)
-              : command.message as string;
+            promptMessage = typeof command.message === "string" ? command.message : command.message as string;
+            inlineSkillContext = typeof command.message === "string"
+              ? this.prepareInlineSkillContext(command.message)
+              : undefined;
+            this.assertInlineSkillAgentBoundary(inlineSkillContext);
           } catch (error) {
             finishPrompt();
             throw error;
@@ -873,7 +1037,7 @@ export class AgentSessionWrapper {
 
           let prompt: Promise<void>;
           try {
-            prompt = this.inner.prompt(promptMessage, {
+            prompt = this.runInlineSkillRequest(inlineSkillContext, () => this.inner.prompt(promptMessage, {
               ...(promptImages?.length ? { images: promptImages } : {}),
               ...(streamingBehavior ? { streamingBehavior } : {}),
               source: "rpc",
@@ -882,7 +1046,7 @@ export class AgentSessionWrapper {
               // Every disposition (handled, queued, started) is an acceptance; a
               // rejected prompt never calls this and rejects `prompt` instead.
               preflightResult: () => acceptPreflight(),
-            });
+            }));
           } catch (error) {
             finishPrompt();
             throw error;
@@ -1166,10 +1330,13 @@ export class AgentSessionWrapper {
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
           const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-          const message = typeof command.message === "string"
-            ? this.prepareInlineSkillMessage(command.message)
-            : command.message as string;
-          await this.inner.steer(message, steerImages?.length ? steerImages : undefined);
+          const message = typeof command.message === "string" ? command.message : command.message as string;
+          const inlineSkillContext = typeof command.message === "string"
+            ? this.prepareInlineSkillContext(command.message)
+            : undefined;
+          this.assertInlineSkillAgentBoundary(inlineSkillContext);
+          await this.runInlineSkillRequest(inlineSkillContext, () =>
+            this.inner.steer(message, steerImages?.length ? steerImages : undefined));
           return null;
         } finally {
           releaseAdmission();
@@ -1180,10 +1347,13 @@ export class AgentSessionWrapper {
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
           const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-          const message = typeof command.message === "string"
-            ? this.prepareInlineSkillMessage(command.message)
-            : command.message as string;
-          await this.inner.followUp(message, followImages?.length ? followImages : undefined);
+          const message = typeof command.message === "string" ? command.message : command.message as string;
+          const inlineSkillContext = typeof command.message === "string"
+            ? this.prepareInlineSkillContext(command.message)
+            : undefined;
+          this.assertInlineSkillAgentBoundary(inlineSkillContext);
+          await this.runInlineSkillRequest(inlineSkillContext, () =>
+            this.inner.followUp(message, followImages?.length ? followImages : undefined));
           return null;
         } finally {
           releaseAdmission();
@@ -1255,7 +1425,7 @@ export class AgentSessionWrapper {
           this.extensionStatuses.clear();
           this.resetExtensionWidgetsForReload();
           this.syncProjectTrust();
-          await this.inner.reload();
+          await this.reloadInnerSession();
           // pi rebuilds from the tools active before, then extensions adjust them as they start
           // again; carry that result so a tool one switched off during reload stays off.
           this.setActiveToolSelection(activeToolNames);
@@ -1363,6 +1533,7 @@ export class AgentSessionWrapper {
 
     const finishDispose = () => {
       try {
+        this.restoreInlineSkillAgentBoundary();
         this.inner.dispose();
       } finally {
         this.onDestroyCallback?.();
@@ -2004,7 +2175,7 @@ export class AgentSessionWrapper {
         this.extensionStatuses.clear();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
-        await this.inner.reload({
+        await this.reloadInnerSession({
           beforeSessionStart: () => {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
           },
@@ -2473,6 +2644,7 @@ export async function startRpcSession(
     // after the session is created, so the getter is filled in below.
     const exactSystemPromptRef: { current?: () => string } = {};
     const exactSystemPromptExtension = createExactSystemPromptExtension(() => exactSystemPromptRef.current?.());
+    const inlineSkillContextExtension = createInlineSkillContextExtension();
     const usesExactSystemPrompt = chatOnly || subagentResources?.exactSystemPrompt !== undefined;
     // codemode, tool-search, and mcp, as the pi CLI loads them, and the host that decides
     // which MCP servers the session connects (ADR 0006).
@@ -2509,7 +2681,7 @@ export async function startRpcSession(
             ],
           }
         : chatOnly
-          ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension] }
+          ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension, inlineSkillContextExtension] }
         : {
             extensionFactories: [
               ...(builtins?.extensions ?? []),
@@ -2523,6 +2695,7 @@ export async function startRpcSession(
                 () => listSubagentProfiles(sessionCwd),
                 isBuiltInSubagentsEnabled,
               ),
+              inlineSkillContextExtension,
             ],
             extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
           }),

@@ -1401,15 +1401,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           // already appended it optimistically. Consume only the still-adjacent
           // optimistic bubble; later same-text queue deliveries must render.
           const delivered = normalizeToolCalls(completed);
-          const deliveredKey = userMessageKey(delivered);
           const optimisticKey = optimisticUserMessageKeyRef.current;
           optimisticUserMessageKeyRef.current = null;
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (optimisticKey && last?.role === "user" && userMessageKey(last) === optimisticKey) {
-              return optimisticKey === deliveredKey
-                ? prev
-                : [...prev.slice(0, -1), delivered];
+              // Identical text can still carry authoritative skill metadata,
+              // normalized images or timestamps absent from the optimistic copy.
+              return [...prev.slice(0, -1), delivered];
             }
             return [...prev, delivered];
           });

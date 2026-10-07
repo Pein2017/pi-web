@@ -19,6 +19,7 @@ const {
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 const { splitFinalAssistantBlocks } = await jiti.import("@/lib/message-display");
 const { clearExpandedToolCalls, setToolCallExpanded } = await jiti.import("@/lib/tool-call-expansion");
+const { getSkillContextDisplay } = await jiti.import("@/lib/skill-context-display");
 
 function renderMessage(message, props = {}) {
   return renderToStaticMarkup(
@@ -35,9 +36,62 @@ test("inline skill references remain literal in user Markdown without disabling 
   const message = { role: "user", content };
   const html = renderMessage(message);
   assert.ok(html.includes("Use $alpha and $beta."), "skill references must not become paired inline math");
+  assert.match(html, /\$alpha/);
+  assert.match(html, /\$beta/);
   assert.doesNotMatch(html, /class="katex"/);
   assert.equal(message.content, content, "presentation must not rewrite persisted or copied input");
   assert.match(renderMessage({ role: "user", content: "Solve $x^2$." }), /class="katex"/);
+});
+
+test("renders validated legacy inline skills as short prompt and opt-in context", () => {
+  const prompt = "Use $alpha and $beta.";
+  const content = `${prompt}\n\n<skill name="alpha" location="/skills/alpha/SKILL.md">\nReferences are relative to /skills/alpha.\n\nAlpha body.\n</skill>\n\n<skill name="beta" location="/skills/beta/SKILL.md">\nReferences are relative to /skills/beta.\n\nBeta body.\n</skill>`;
+  const html = renderMessage({ role: "user", content });
+
+  assert.match(html, /Use \$alpha and \$beta\./);
+  assert.match(html, />\$alpha</);
+  assert.match(html, />\$beta</);
+  assert.match(html, /Show skill instructions/);
+  assert.match(html, /aria-expanded="false"/);
+  assert.doesNotMatch(html, /Alpha body\.|Beta body\./, "skill instructions stay hidden by default");
+  assert.match(html, /data-skill-context="legacy-appended"/);
+});
+
+test("renders validated per-message snapshots opt-in and edits only raw user content", () => {
+  const prompt = "Review $alpha and solve $x^2$.";
+  const metadata = {
+    version: 1,
+    requestId: "request-1",
+    skills: [{ name: "alpha", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", body: "Alpha snapshot body." }],
+  };
+  const message = { role: "user", content: prompt, piWeb: { inlineSkillContext: metadata } };
+  const html = renderMessage(message);
+
+  assert.match(html, /Review \$alpha and solve/);
+  assert.match(html, /class="katex"/);
+  assert.match(html, />\$alpha</);
+  assert.match(html, /Show skill instructions/);
+  assert.match(html, /aria-expanded="false"/);
+  assert.doesNotMatch(html, /Alpha snapshot body\./);
+  assert.doesNotMatch(html, /\/skills\/alpha\/SKILL\.md/, "paths are disclosed only on demand");
+  assert.match(html, /data-skill-context="metadata"/);
+
+  const editTarget = replaceUserMessageText(message, prompt);
+  assert.deepEqual(editTarget, { role: "user", content: prompt });
+});
+
+test("uses the original short prompt for legacy skill copy and edit targets", () => {
+  const prompt = "Review this with $review.";
+  const expanded = `${prompt}\n\n<skill name="review" location="/skills/review/SKILL.md">\nReferences are relative to /skills/review.\n\nPrivate skill instructions.\n</skill>`;
+  const display = getSkillContextDisplay(expanded);
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJDRA==" } };
+  const message = { role: "user", content: [{ type: "text", text: expanded }, image] };
+
+  assert.equal(display.prompt, prompt);
+  assert.equal(display.source, "legacy-appended");
+  const editTarget = replaceUserMessageText(message, display.prompt);
+  assert.deepEqual(editTarget.content, [{ type: "text", text: prompt }, image]);
+  assert.equal(display.prompt, prompt, "the copy target is also the original prompt");
 });
 
 test("updates a reused message when its written files change", () => {

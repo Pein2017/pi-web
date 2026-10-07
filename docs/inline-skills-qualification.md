@@ -1,5 +1,14 @@
 # Inline skill qualification — 2026-10-07
 
+> Historical first implementation qualification, published in `93cc3c0`.
+> The later user review identified a missing acceptance boundary: generated skill
+> bodies were appended to the user message and displayed by default. The checks
+> below established instruction delivery, not compact user-message behavior.
+> The current correction is tracked by tasks 4.1–4.4 of the same OpenSpec change;
+> its [accepted correction record](inline-skill-context-qualification.md) supersedes
+> the earlier message-presentation claim. These historical results are not rerun evidence for changed
+> code.
+
 ## Accepted candidate
 
 Lead-accepted local implementation in `/data/CoordExp/codex-tools/pi-web`, based on

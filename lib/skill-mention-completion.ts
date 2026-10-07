@@ -39,8 +39,11 @@ export function getSkillMentionSuggestions(
 /** Keep loaded dollar references out of Markdown's paired inline-math syntax.
  * Only presentation changes: raw session text, copying and editing stay intact.
  */
-export function preserveSkillReferencesInMarkdown(text: string): string {
-  const names = new Set([...text.matchAll(/<skill name="([a-z0-9-]+)" location="/g)].map(match => match[1]));
+export function preserveSkillReferencesInMarkdown(text: string, skillNames: readonly string[] = []): string {
+  const names = new Set([
+    ...[...text.matchAll(/<skill name="([a-z0-9-]+)" location="/g)].map(match => match[1]),
+    ...skillNames,
+  ]);
   if (names.size === 0) return text;
   let rendered = text;
   for (const mention of scanSkillMentions(text).reverse()) {

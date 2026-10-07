@@ -6,6 +6,8 @@ Pi Web's leading `/skill:name` command expands one skill and replaces the compos
 
 - Add cursor-aware `$` skill completion throughout the composer, preserving surrounding text, attachments and existing slash/file completion.
 - Resolve inline names against the active Web session's loaded skill catalog and include each referenced skill's instructions once, in first-appearance order.
+- Keep the original user message compact and unchanged. Preserve selected name/path identities and loaded instruction snapshots separately from user-authored text, and deliver the snapshots as distinct model context.
+- Render selected references compactly, expose instructions only on demand, and make copying/editing use the original request. Support existing expanded inline history without rewriting session files.
 - Apply the same expansion to ordinary prompts and supported queued steer/follow-up inputs through Web-owned public SDK integration.
 - Keep unknown references, escaped dollars and code literals unchanged; retain existing `/skill:name` behavior and session trust/resource restrictions.
 - Record bounded regression and real SDK/browser acceptance evidence.

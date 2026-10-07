@@ -10,6 +10,24 @@ const chatInputSource = await jitiSource(new URL("../components/ChatInput.tsx", 
 const messageViewSource = await jitiSource(new URL("../components/MessageView.tsx", import.meta.url));
 const appShellSource = await jitiSource(new URL("../components/AppShell.tsx", import.meta.url));
 
+test("authoritative user delivery replaces an optimistic bubble even when text is identical", async () => {
+  const demoSource = await jitiSource(new URL("../demo/hooks/useAgentSession.ts", import.meta.url));
+  for (const hookSource of [source, demoSource]) {
+    const endSource = hookSource.slice(hookSource.indexOf('case "message_end"'), hookSource.indexOf('case "tool_execution_start"'));
+    const body = endSource.match(/setMessages\(\(prev\) => \{([\s\S]*?)\n\s*\}\);/)?.[1];
+    assert.ok(body, "exercise the real delivered-user state updater");
+    const update = new Function("prev", "optimisticKey", "deliveredKey", "delivered", "userMessageKey", body);
+    const key = (message) => JSON.stringify(message.content);
+    const optimistic = { role: "user", content: "Use $alpha." };
+    const delivered = { ...optimistic, piWeb: { inlineSkillContext: { version: 1, requestId: "delivery", skills: [{ name: "alpha", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", body: "Snapshot." }] } } };
+    const result = update([optimistic], key(optimistic), key(delivered), delivered, key);
+    assert.equal(result.length, 1, "no duplicate initial user bubble");
+    assert.equal(result[0], delivered, "the authoritative message carries loaded skill metadata");
+    const repeated = update(result, null, key(delivered), delivered, key);
+    assert.equal(repeated.length, 2, "later identical-text queued deliveries remain separate");
+  }
+});
+
 test("keeps the session event stream open through the idle grace window", () => {
   const finishSource = source.slice(
     source.indexOf("const finishPromptWithoutStream"),
