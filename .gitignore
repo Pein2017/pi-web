@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+# Local recovery, scratch, and generated test fixtures (never source inputs).
 /.local/
 /.pnp
 .pnp.*
