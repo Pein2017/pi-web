@@ -13,9 +13,55 @@ const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
 const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, cycleListIndex, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, modelSupportsImageInput, offersBuiltinSlashCommandWhileStreaming, replaceLinksWithMarkdown, shouldCompressImageFile, submitsSlashCommandOnEnter } = await jiti.import("./ChatInput.tsx");
 const { isBareMcpCommand } = await jiti.import("@/lib/mcp-command.ts");
+const { completeSkillMention, getSkillMentionSuggestions } = await jiti.import("@/lib/skill-mention-completion.ts");
+const { getActiveSkillMention } = await jiti.import("@/lib/skill-mentions.ts");
 const { ModelSelector } = await jiti.import("./ModelSelector.tsx");
 const { clearDraft, getDraft, mergeRestoredSubmissionDraft, mergeRestoredSubmissionText, rekeyDraft, setDraft } = await jiti.import("@/lib/draft-store.ts");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
+
+test("filters dollar completions to skill catalog entries and keeps paths UI-only", () => {
+  const suggestions = getSkillMentionSuggestions([
+    { name: "skill:alpha", source: "skill", description: "Alpha instructions", sourceInfo: { path: "/registered/alpha/SKILL.md" } },
+    { name: "skill:alpine", source: "skill", description: "Alpine instructions" },
+    { name: "skill:3d-tools", source: "skill", description: "Numeric-leading skill" },
+    { name: "skill:alpha_bad", source: "skill", description: "Invalid skill name" },
+    { name: "skill:alpha--bad", source: "skill", description: "Invalid skill name" },
+    { name: "skill:alias", source: "extension", description: "Not a skill source" },
+    { name: "skill:prompt", source: "prompt", description: "Not a skill source" },
+    { name: "alpha", source: "skill", description: "Missing the skill: prefix" },
+  ], "al");
+
+  assert.deepEqual(suggestions, [
+    { identity: "/registered/alpha/SKILL.md", name: "alpha", description: "Alpha instructions" },
+    { identity: "skill:alpine", name: "alpine", description: "Alpine instructions" },
+  ]);
+  assert.deepEqual(
+    getSkillMentionSuggestions([
+      { name: "skill:alpha", source: "skill" },
+      { name: "skill:3d-tools", source: "skill" },
+    ], "").map(({ name }) => name),
+    ["alpha", "3d-tools"],
+  );
+
+  const completion = completeSkillMention(
+    "Use $alpine after",
+    { query: "al", start: 4, end: 11 },
+    suggestions[0].name,
+  );
+  assert.equal(completion.value, "Use $alpha after");
+  assert.equal(completion.cursor, "Use $alpha".length);
+  assert.equal(completion.value.includes(suggestions[0].identity), false);
+
+  const unicodeText = "💡 $a after";
+  const start = unicodeText.indexOf("$");
+  const unicodeCompletion = completeSkillMention(
+    unicodeText,
+    { query: "a", start, end: start + 2 },
+    "3d-tools",
+  );
+  assert.equal(unicodeCompletion.value, "💡 $3d-tools after");
+  assert.equal(unicodeCompletion.cursor, "💡 $3d-tools".length);
+});
 
 test("preserves pasted HTML links as Markdown without changing plain text layout", () => {
   const link = (label, href, occurrence = 0) => ({ label, href, occurrence });
@@ -92,6 +138,7 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
       isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
       historyMenuOpen: false, inputHistory: ["previous"], historyActiveIndex: 0,
       slashMenuOpen: false, slashQuery: null, displayedSlashCommands: [{}], slashActiveIndex: 0,
+      skillMenuOpen: false, skillMention: null,
       atMenuOpen: false, atQuery: null, atMatches: [{}], atActiveIndex: 0,
       onSteer() {}, onFollowUp() {},
       sendQueued(mode) { action = mode; }, handleSend() { action = "send"; },
@@ -132,6 +179,7 @@ test("file mention arrows wrap around the match list", () => {
       isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
       historyMenuOpen: false, inputHistory: [], historyActiveIndex: 0,
       slashMenuOpen: false, slashQuery: null, displayedSlashCommands: [], slashActiveIndex: 0,
+      skillMenuOpen: false, skillMention: null,
       atMenuOpen: true, atQuery: {}, atMatches: Array.from({ length }, () => ({})), atActiveIndex,
       onSteer() {}, onFollowUp() {},
       sendQueued() {}, handleSend() {},
@@ -159,6 +207,209 @@ test("file mention arrows wrap around the match list", () => {
   assert.equal(move("ArrowUp", 1, 3), 0);
   assert.equal(move("ArrowDown", 0, 1), 0);
   assert.equal(move("ArrowDown", 0, 0), 0);
+});
+
+test("skill mention menu handles keyboard selection without sending", () => {
+  const source = ts.createSourceFile("ChatInput.tsx", readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findHandler(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "handleKeyDown") {
+      return node.initializer.arguments[0];
+    }
+    return ts.forEachChild(node, findHandler);
+  }
+  const script = new Script(ts.transpileModule(findHandler(source).getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 },
+  }).outputText);
+
+  function press(key, skillActiveIndex = 0) {
+    let action = "none";
+    let stopped = false;
+    const dismissedSkillMentionRef = { current: null };
+    const handler = script.runInNewContext({
+      Date: { now: () => 1000 },
+      COMPOSITION_END_ENTER_GRACE_MS: 100,
+      isMobile: false, isStreaming: false, enterSendMode: "enter",
+      isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
+      historyMenuOpen: false, inputHistory: [], historyActiveIndex: 0,
+      slashMenuOpen: false, slashQuery: null, displayedSlashCommands: [], slashActiveIndex: 0,
+      compact: true,
+      skillMenuOpen: true, skillMention: { query: "al", start: 4, end: 7 },
+      skillSuggestions: [{ name: "alpha" }, { name: "beta" }], skillActiveIndex,
+      dismissedSkillMentionRef,
+      atMenuOpen: false, atQuery: null, atMatches: [], atActiveIndex: 0,
+      onSteer() {}, onFollowUp() {}, sendQueued() {},
+      handleSend() { action = "send"; },
+      applySlashCommand() {}, setSlashMenuOpen() {},
+      applySkillCompletion(suggestion) { action = `complete:${suggestion.name}`; },
+      setSkillMenuOpen(open) { action = open ? "open" : "close"; },
+      setSkillActiveIndex(update) {
+        const next = typeof update === "function" ? update(skillActiveIndex) : update;
+        action = `index:${next}`;
+      },
+      cycleListIndex,
+      applyAtCompletion() {}, setAtMenuOpen() {},
+      applyHistoryInput() {},
+      value: "Use $al",
+    });
+    handler({
+      key, shiftKey: false, altKey: false, ctrlKey: false, metaKey: false,
+      nativeEvent: { isComposing: false, keyCode: 0 },
+      preventDefault() {},
+      stopPropagation() { stopped = true; },
+    });
+    if (key === "Escape") {
+      assert.equal(stopped, true);
+      assert.equal(dismissedSkillMentionRef.current.start, 4);
+      assert.equal(dismissedSkillMentionRef.current.name, "al");
+    }
+    return action;
+  }
+
+  assert.equal(press("ArrowDown"), "index:1");
+  assert.equal(press("ArrowUp"), "index:1");
+  assert.equal(press("Tab"), "complete:alpha");
+  assert.equal(press("Enter"), "complete:alpha");
+  assert.equal(press("Escape"), "close");
+});
+
+test("compact composer tracks dollar mentions while Escape dismisses the same token", () => {
+  const source = ts.createSourceFile("ChatInput.tsx", readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findCallback(name) {
+    function visit(node) {
+      if (ts.isVariableDeclaration(node) && node.name.getText(source) === name) {
+        return node.initializer.arguments[0];
+      }
+      return ts.forEachChild(node, visit);
+    }
+    const callback = visit(source);
+    assert.ok(callback, `expected ${name} callback`);
+    return new Script(ts.transpileModule(`(${callback.getText(source)})`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2020 },
+    }).outputText);
+  }
+
+  let activeMention = null;
+  const dismissedSkillMentionRef = { current: null };
+  const updateContext = {
+    compact: true,
+    dismissedSkillMentionRef,
+    getActiveSkillMention,
+    setSkillMention(value) { activeMention = value; },
+  };
+  const updateSkillMention = findCallback("updateSkillMention").runInNewContext(updateContext);
+  updateSkillMention("Use $alpine", 7);
+  assert.deepEqual(activeMention, { query: "al", start: 4, end: 11 });
+
+  const handleKeyDown = findCallback("handleKeyDown").runInNewContext({
+    Date: { now: () => 1000 },
+    COMPOSITION_END_ENTER_GRACE_MS: 100,
+    isMobile: false, isStreaming: false, enterSendMode: "enter",
+    isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
+    historyMenuOpen: false, inputHistory: [], historyActiveIndex: 0,
+    slashMenuOpen: false, slashQuery: null, displayedSlashCommands: [], slashActiveIndex: 0,
+    compact: true,
+    skillMenuOpen: true, skillMention: { query: "al", start: 4, end: 11 },
+    skillSuggestions: [{ name: "alpha" }], skillActiveIndex: 0,
+    dismissedSkillMentionRef,
+    atMenuOpen: false, atQuery: null, atMatches: [], atActiveIndex: 0,
+    onSteer() {}, onFollowUp() {}, sendQueued() {}, handleSend() {},
+    applySlashCommand() {}, setSlashMenuOpen() {}, setSkillActiveIndex() {},
+    applySkillCompletion() {}, setSkillMenuOpen() {}, setAtMenuOpen() {},
+    applyAtCompletion() {}, applyHistoryInput() {}, value: "Use $alpine",
+    submitsSlashCommandOnEnter, cycleListIndex,
+  });
+  let stopped = false;
+  handleKeyDown({
+    key: "Escape", shiftKey: false, altKey: false, ctrlKey: false, metaKey: false,
+    nativeEvent: { isComposing: false, keyCode: 0 },
+    preventDefault() {}, stopPropagation() { stopped = true; },
+  });
+  assert.equal(stopped, true);
+  assert.equal(dismissedSkillMentionRef.current.start, 4);
+  assert.equal(dismissedSkillMentionRef.current.name, "alpine");
+
+  activeMention = "not-cleared";
+  updateSkillMention("Use $alpine", 7);
+  assert.equal(activeMention, null);
+});
+
+test("compact skill completion handler preserves suffix and restores the caret after the name", () => {
+  const source = ts.createSourceFile("ChatInput.tsx", readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findCallback(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "applySkillCompletion") {
+      return node.initializer.arguments[0];
+    }
+    return ts.forEachChild(node, findCallback);
+  }
+  const callback = findCallback(source);
+  assert.ok(callback, "expected applySkillCompletion callback");
+  const applySkillCompletion = new Script(ts.transpileModule(`(${callback.getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 },
+  }).outputText);
+
+  const textarea = {
+    style: { height: "" }, scrollHeight: 80,
+    focus() { this.focused = true; },
+    setSelectionRange(start, end) { this.selection = [start, end]; },
+  };
+  let value = "Use $alpine after";
+  const valueRef = { current: value };
+  const dismissedSkillMentionRef = { current: null };
+  const complete = applySkillCompletion.runInNewContext({
+    compact: true,
+    value,
+    skillMention: { query: "al", start: 4, end: 11 },
+    completeSkillMention,
+    dismissedSkillMentionRef,
+    valueRef,
+    setValue(next) { value = next; },
+    setSkillMention() {}, setSkillMenuOpen() {}, setSkillActiveIndex() {},
+    requestAnimationFrame(callback) { callback(); },
+    textareaRef: { current: textarea },
+  });
+  complete({ name: "alpha" });
+
+  assert.equal(value, "Use $alpha after");
+  assert.equal(valueRef.current, value);
+  assert.deepEqual(textarea.selection, ["Use $alpha".length, "Use $alpha".length]);
+  assert.equal(textarea.focused, true);
+  assert.equal(dismissedSkillMentionRef.current.start, 4);
+  assert.equal(dismissedSkillMentionRef.current.name, "alpha");
+});
+
+test("skill suggestion buttons select through click activation", () => {
+  const source = ts.createSourceFile("ChatInput.tsx", readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findSkillButton(node) {
+    if (ts.isJsxElement(node) && node.openingElement.tagName.getText(source) === "button") {
+      const attributes = node.openingElement.attributes.properties;
+      const label = attributes.find((attribute) => (
+        ts.isJsxAttribute(attribute)
+        && attribute.name.getText(source) === "aria-label"
+        && attribute.initializer?.getText(source).includes("suggestion.name")
+      ));
+      if (label) return node;
+    }
+    return ts.forEachChild(node, findSkillButton);
+  }
+  const button = findSkillButton(source);
+  assert.ok(button, "expected skill suggestion button");
+  const attributes = button.openingElement.attributes.properties;
+  const click = attributes.find((attribute) => ts.isJsxAttribute(attribute) && attribute.name.getText(source) === "onClick");
+  assert.ok(click && ts.isJsxExpression(click.initializer) && click.initializer.expression, "expected click handler for keyboard activation");
+  assert.match(button.openingElement.getText(source), /type="button"/);
+
+  let selected = null;
+  let sends = 0;
+  const activate = new Script(ts.transpileModule(`(${click.initializer.expression.getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 },
+  }).outputText).runInNewContext({
+    suggestion: { name: "alpha" },
+    applySkillCompletion(value) { selected = value; },
+    handleSend() { sends += 1; },
+  });
+  activate();
+  assert.deepEqual(selected, { name: "alpha" });
+  assert.equal(sends, 0);
 });
 
 test("cycleListIndex wraps in both directions", () => {

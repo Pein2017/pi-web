@@ -30,6 +30,16 @@ function renderMessage(message, props = {}) {
   );
 }
 
+test("inline skill references remain literal in user Markdown without disabling ordinary math", () => {
+  const content = 'Use $alpha and $beta.\n\n<skill name="alpha" location="/skills/alpha/SKILL.md">\nAlpha body.\n</skill>\n\n<skill name="beta" location="/skills/beta/SKILL.md">\nBeta body.\n</skill>';
+  const message = { role: "user", content };
+  const html = renderMessage(message);
+  assert.ok(html.includes("Use $alpha and $beta."), "skill references must not become paired inline math");
+  assert.doesNotMatch(html, /class="katex"/);
+  assert.equal(message.content, content, "presentation must not rewrite persisted or copied input");
+  assert.match(renderMessage({ role: "user", content: "Solve $x^2$." }), /class="katex"/);
+});
+
 test("updates a reused message when its written files change", () => {
   const props = { message: { role: "assistant", content: [] } };
   assert.equal(MessageView.compare(props, props), true);

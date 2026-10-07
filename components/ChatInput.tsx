@@ -22,6 +22,11 @@ import {
   buildEntriesFromFiles, buildAtInsertText, extractAtQuery, filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import { getActiveSkillMention, type ActiveSkillMention } from "@/lib/skill-mentions";
+import {
+  completeSkillMention, getSkillMentionSuggestions,
+  type SkillMentionSuggestion,
+} from "@/lib/skill-mention-completion";
 import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
 import { isBareMcpCommand, isBuiltinMcpCommand } from "@/lib/mcp-command";
 import { FolderIcon, getFileIcon } from "./FileIcons";
@@ -620,6 +625,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [atMenuOpen, setAtMenuOpen] = useState(false);
   const [atMenuMaxHeight, setAtMenuMaxHeight] = useState<number | null>(null);
   const [atActiveIndex, setAtActiveIndex] = useState(0);
+  const [skillMention, setSkillMention] = useState<ActiveSkillMention | null>(null);
+  const [skillMenuOpen, setSkillMenuOpen] = useState(false);
+  const [skillActiveIndex, setSkillActiveIndex] = useState(0);
+  const [skillMenuMaxHeight, setSkillMenuMaxHeight] = useState<number | null>(null);
   const [imageWarningDismissed, setImageWarningDismissed] = useState(false);
   const [historyMenuOpen, setHistoryMenuOpen] = useState(false);
   const [historyActiveIndex, setHistoryActiveIndex] = useState(0);
@@ -649,6 +658,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const slashItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const atMenuRef = useRef<HTMLDivElement>(null);
   const atItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const skillMenuRef = useRef<HTMLDivElement>(null);
+  const skillItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const dismissedSkillMentionRef = useRef<{ start: number; name: string } | null>(null);
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<string | null>(null);
@@ -659,6 +671,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
 
+  const clearSkillMention = useCallback(() => {
+    dismissedSkillMentionRef.current = null;
+    setSkillMention(null);
+    setSkillMenuOpen(false);
+    setSkillActiveIndex(0);
+  }, []);
+
   useImperativeHandle(ref, () => ({
     insertIfEmpty(text: string) {
       const ta = textareaRef.current;
@@ -667,6 +686,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       valueRef.current = text;
       setValue(text);
       setAtQuery(null);
+      clearSkillMention();
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
@@ -685,6 +705,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       attachedImagesRef.current = restoredImages;
       setValue(restoredText);
       setAtQuery(null);
+      clearSkillMention();
       setHistoryMenuOpen(false);
       setAttachedImages((prev) => {
         prev.forEach(revokeImagePreview);
@@ -707,6 +728,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       valueRef.current = combined;
       setValue(combined);
       setAtQuery(null);
+      clearSkillMention();
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
@@ -745,6 +767,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         return movedImages;
       });
       setAtQuery(null);
+      clearSkillMention();
       setHistoryMenuOpen(false);
     },
     restoreSubmission(text: string, images?: ChatDraftImage[], targetDraftKey?: string) {
@@ -791,6 +814,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         return restored;
       });
       setAtQuery(null);
+      clearSkillMention();
       setHistoryMenuOpen(false);
       if (images?.length) {
         setAttachedImages((current) => {
@@ -815,6 +839,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       const ta = textareaRef.current;
       if (!ta) {
         setValue((v) => v + (v ? " " : "") + text);
+        clearSkillMention();
         return;
       }
       const start = ta.selectionStart ?? ta.value.length;
@@ -826,6 +851,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       valueRef.current = newVal;
       setValue(newVal);
       setAtQuery(null);
+      clearSkillMention();
       requestAnimationFrame(() => {
         if (!ta) return;
         const pos = start + sep.length + text.length;
@@ -892,6 +918,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     valueRef.current = "";
     setValue("");
     setAtQuery(null);
+    clearSkillMention();
     setHistoryMenuOpen(false);
     if (draftKey) clearDraft(draftKey);
     if (draftKeyRef.current && draftKeyRef.current !== draftKey) clearDraft(draftKeyRef.current);
@@ -899,7 +926,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearImages, draftKey]);
+  }, [clearImages, clearSkillMention, draftKey]);
 
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
@@ -928,12 +955,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     attachedImagesRef.current = nextImages;
     setValue(nextValue);
     setAtQuery(null);
+    clearSkillMention();
     setHistoryMenuOpen(false);
     setAttachedImages((prev) => {
       prev.forEach(revokeImagePreview);
       return nextImages;
     });
-  }, [draftKey]);
+  }, [clearSkillMention, draftKey]);
 
   const resizeTextarea = useCallback(() => {
     const ta = textareaRef.current;
@@ -1013,6 +1041,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const slashQuery = !compact && value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
     : null;
+  const skillMentionKey = skillMention === null
+    ? null
+    : `${skillMention.start}:${skillMention.end}:${skillMention.query}`;
+  const skillSuggestions = React.useMemo(() => (
+    skillMention === null
+      ? []
+      : getSkillMentionSuggestions(slashCommands ?? [], skillMention.query)
+  ), [slashCommands, skillMention]);
+  const skillSuggestionCountLabel = skillSuggestions.length === 1
+    ? t("chat.match")
+    : t("chat.matches", { count: skillSuggestions.length });
 
   const filteredSlashCommands = (() => {
     if (slashQuery === null) return [];
@@ -1066,6 +1105,23 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const pos = cursor ?? text.length;
     setAtQuery(extractAtQuery(text.slice(0, pos)));
   }, [cwd]);
+
+  const updateSkillMention = useCallback((text: string, cursor: number | null, userEdited = false) => {
+    if (userEdited) dismissedSkillMentionRef.current = null;
+    const match = getActiveSkillMention(text, cursor ?? text.length);
+    const dismissed = dismissedSkillMentionRef.current;
+    if (
+      dismissed
+      && match !== null
+      && match.start === dismissed.start
+      && text.slice(match.start + 1, match.end) === dismissed.name
+    ) {
+      setSkillMention(null);
+      return;
+    }
+    dismissedSkillMentionRef.current = null;
+    setSkillMention(match);
+  }, []);
 
   const atQueryText = atQuery?.query ?? null;
   const atLocalMatches: FileIndexEntry[] = React.useMemo(() => (
@@ -1177,11 +1233,55 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, [atQuery, value]);
 
+  const applySkillCompletion = useCallback((suggestion: SkillMentionSuggestion) => {
+    if (!skillMention) return;
+    const completion = completeSkillMention(value, skillMention, suggestion.name);
+    dismissedSkillMentionRef.current = { start: skillMention.start, name: suggestion.name };
+    valueRef.current = completion.value;
+    setValue(completion.value);
+    setSkillMention(null);
+    setSkillMenuOpen(false);
+    setSkillActiveIndex(0);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(completion.cursor, completion.cursor);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    });
+  }, [skillMention, value]);
+
   useEffect(() => {
     if (atActiveIndex >= atMatches.length) {
       setAtActiveIndex(Math.max(0, atMatches.length - 1));
     }
   }, [atMatches.length, atActiveIndex]);
+
+  useEffect(() => {
+    if (skillMentionKey === null) {
+      setSkillMenuOpen(false);
+      setSkillActiveIndex(0);
+      return;
+    }
+    setSkillMenuOpen(true);
+    setSkillActiveIndex(0);
+  }, [skillMentionKey]);
+
+  useEffect(() => {
+    if (skillActiveIndex >= skillSuggestions.length) {
+      setSkillActiveIndex(Math.max(0, skillSuggestions.length - 1));
+    }
+  }, [skillActiveIndex, skillSuggestions.length]);
+
+  useEffect(() => {
+    skillItemRefs.current.length = skillSuggestions.length;
+  }, [skillSuggestions.length]);
+
+  useEffect(() => {
+    if (!skillMenuOpen) return;
+    skillItemRefs.current[skillActiveIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [skillActiveIndex, skillMenuOpen]);
 
   useEffect(() => {
     atItemRefs.current.length = atMatches.length;
@@ -1212,6 +1312,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     setHistoryMenuOpen(false);
     setHistoryActiveIndex(0);
     setAtQuery(null);
+    clearSkillMention();
     requestAnimationFrame(() => {
       const ta = textareaRef.current;
       if (!ta) return;
@@ -1220,7 +1321,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [clearSkillMention]);
 
   const applySlashCommand = useCallback((command: SlashCommandPaletteItem) => {
     const nextValue = `/${command.name} `;
@@ -1403,6 +1504,36 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
 
+      // Skill completion is suggestion-only: Enter/Tab select but never submit.
+      if (skillMenuOpen && skillMention !== null && !isComposing) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSkillActiveIndex((i) => cycleListIndex(i, skillSuggestions.length, 1));
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSkillActiveIndex((i) => cycleListIndex(i, skillSuggestions.length, -1));
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          dismissedSkillMentionRef.current = {
+            start: skillMention.start,
+            name: value.slice(skillMention.start + 1, skillMention.end),
+          };
+          setSkillMenuOpen(false);
+          return;
+        }
+        const selectedSkill = skillSuggestions[skillActiveIndex];
+        if ((e.key === "Tab" || acceptShortcut) && selectedSkill) {
+          e.preventDefault();
+          applySkillCompletion(selectedSkill);
+          return;
+        }
+      }
+
       // @ file menu — skip while composing so IME candidate navigation
       // (arrows/Enter/Tab) is never intercepted.
       if (atMenuOpen && atQuery !== null && !isComposing) {
@@ -1431,6 +1562,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (e.key === "ArrowUp" && !isComposing && !isStreaming && inputHistory.length > 0 && value.trim().length === 0) {
         e.preventDefault();
         setSlashMenuOpen(false);
+        setSkillMenuOpen(false);
         setAtMenuOpen(false);
         setHistoryActiveIndex(inputHistory.length - 1);
         setHistoryMenuOpen(true);
@@ -1453,7 +1585,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
     },
-    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
+    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, skillMenuOpen, skillMention, skillSuggestions, skillActiveIndex, applySkillCompletion, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
   );
 
   const handleInput = useCallback(() => {
@@ -1499,28 +1631,33 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     setValue(nextValue);
     setHistoryMenuOpen(false);
     updateAtQuery(nextValue, start + markdown.length);
+    updateSkillMention(nextValue, start + markdown.length, true);
     requestAnimationFrame(() => {
       ta.focus();
       ta.setSelectionRange(start + markdown.length, start + markdown.length);
     });
-  }, [compact, processImageFiles, updateAtQuery]);
+  }, [compact, processImageFiles, updateAtQuery, updateSkillMention]);
 
   useEffect(() => {
     if (slashQuery === null) {
       setSlashMenuOpen(false);
       setSlashActiveIndex(0);
+    } else {
+      setSlashMenuOpen(true);
+      setSlashActiveIndex(0);
+    }
+
+    if (slashQuery === null && skillMentionKey === null) {
       slashCommandsRequestedRef.current = false;
       return;
     }
-    setSlashMenuOpen(true);
-    setSlashActiveIndex(0);
     if (!slashCommandsRequestedRef.current && onLoadSlashCommands) {
       slashCommandsRequestedRef.current = true;
       Promise.resolve(onLoadSlashCommands()).catch(() => {
         slashCommandsRequestedRef.current = false;
       });
     }
-  }, [slashQuery, onLoadSlashCommands]);
+  }, [slashQuery, skillMentionKey, onLoadSlashCommands]);
 
   // Lazy-load skill dormancy (disable-model-invocation) each time the slash
   // palette opens, so toggles made in the skills panel are reflected on the
@@ -1587,6 +1724,18 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       setAtMenuMaxHeight((current) => current === nextHeight ? current : nextHeight);
     });
   }, [atMenuOpen, atQuery]);
+
+  useLayoutEffect(() => {
+    if (!skillMenuOpen || skillMentionKey === null) {
+      setSkillMenuMaxHeight(null);
+      return;
+    }
+    const menu = skillMenuRef.current;
+    if (!menu) return;
+    return subscribeUpwardMenuMaxHeight(menu, (nextHeight) => {
+      setSkillMenuMaxHeight((current) => current === nextHeight ? current : nextHeight);
+    });
+  }, [skillMenuOpen, skillMentionKey]);
 
   // Build model options: prefer modelList (has provider info), fallback to modelNames
   const modelOptions: ModelSelectorOption[] = (() => {
@@ -2079,6 +2228,111 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               </div>
             </div>
           )}
+          {skillMenuOpen && skillMention !== null && (
+            <div
+              ref={skillMenuRef}
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                bottom: "calc(100% + 8px)",
+                zIndex: 120,
+                background: "var(--bg)",
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                boxShadow: "0 -6px 20px rgba(0,0,0,0.12)",
+                overflow: "hidden",
+                boxSizing: "border-box",
+                display: "flex",
+                flexDirection: "column",
+                maxHeight: skillMenuMaxHeight === null
+                  ? "min(48vh, 400px)"
+                  : `min(48vh, 400px, ${skillMenuMaxHeight}px)`,
+              }}
+            >
+              <div
+                style={{
+                  padding: "8px 10px",
+                  borderBottom: "1px solid var(--border)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  fontSize: 11,
+                  color: "var(--text-dim)",
+                  flexShrink: 0,
+                }}
+              >
+                <span>
+                  {slashCommandsLoading
+                    ? t("chat.loadingCommands")
+                    : t("chat.skillMentions", { label: skillSuggestionCountLabel })}
+                </span>
+                <span style={{ fontFamily: "var(--font-mono)" }}>{t("chat.tabEnter")}</span>
+              </div>
+              <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: 4 }}>
+                {slashCommandsLoading && skillSuggestions.length === 0 ? (
+                  <div style={{ padding: "6px 8px", fontSize: 12, color: "var(--text-dim)" }}>
+                    {t("chat.loadingCommands")}
+                  </div>
+                ) : skillSuggestions.length === 0 ? (
+                  <div style={{ padding: "6px 8px", fontSize: 12, color: "var(--text-dim)" }}>
+                    {t("chat.noMatchingSkills")}
+                  </div>
+                ) : (
+                  skillSuggestions.map((suggestion, index) => {
+                    const active = index === skillActiveIndex;
+                    return (
+                      <button
+                        key={`${suggestion.identity}:${suggestion.name}:${index}`}
+                        ref={(node) => {
+                          skillItemRefs.current[index] = node;
+                        }}
+                        type="button"
+                        aria-label={`$${suggestion.name}`}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => applySkillCompletion(suggestion)}
+                        onMouseEnter={() => setSkillActiveIndex(index)}
+                        style={{
+                          width: "100%",
+                          minWidth: 0,
+                          minHeight: 52,
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 4,
+                          justifyContent: "center",
+                          padding: "7px 8px",
+                          border: "none",
+                          borderRadius: 6,
+                          background: active ? "var(--bg-selected)" : "none",
+                          color: "var(--text)",
+                          cursor: "pointer",
+                          textAlign: "left",
+                        }}
+                      >
+                        <span style={{ fontSize: 12.5, fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
+                          ${suggestion.name}
+                        </span>
+                        {suggestion.description && (
+                          <span style={{
+                            display: "-webkit-box",
+                            WebkitBoxOrient: "vertical",
+                            WebkitLineClamp: 2,
+                            overflow: "hidden",
+                            fontSize: 11,
+                            lineHeight: 1.35,
+                            color: "var(--text-dim)",
+                          }}>
+                            {suggestion.description}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          )}
           {atMenuOpen && atQuery !== null && (() => {
             const indexLoading = fileIndexLoading && (!fileIndex || fileIndex.cwd !== cwd);
              const matchCountLabel = atMatches.length === 1 ? t("chat.match") : t("chat.matches", { count: atMatches.length });
@@ -2210,10 +2464,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               setValue(e.target.value);
               setHistoryMenuOpen(false);
               updateAtQuery(e.target.value, e.target.selectionStart);
+              updateSkillMention(e.target.value, e.target.selectionStart, true);
             }}
             onSelect={(e) => {
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              updateSkillMention(el.value, el.selectionStart);
             }}
             onKeyDown={handleKeyDown}
             onCompositionStart={() => {
@@ -2224,6 +2480,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               lastCompositionEndAtRef.current = Date.now();
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              updateSkillMention(el.value, el.selectionStart, true);
             }}
             onInput={handleInput}
             onPaste={handlePaste}

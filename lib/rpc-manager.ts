@@ -8,6 +8,7 @@ import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
+import { expandInlineSkillMentions } from "./inline-skill-expansion";
 import { invalidateModelsCache } from "./models-cache";
 import { hostRequestDiagnostics } from "./request-diagnostics";
 import { installRequestDiagnostics } from "./request-diagnostic-observer";
@@ -129,6 +130,8 @@ type AgentSessionWrapperOptions = {
   chatOnly?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
+  /** Enables Web inline skill mentions; subagent wrappers intentionally leave this off. */
+  enableInlineSkillExpansion?: boolean;
   disposeRequestDiagnostics?: () => void;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
   mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
@@ -310,6 +313,7 @@ export class AgentSessionWrapper {
   private readonly chatOnly: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
+  private readonly enableInlineSkillExpansion: boolean;
   private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
   private mcpHostDisposed = false;
   private requestDiagnosticsDisposer?: () => void;
@@ -338,6 +342,7 @@ export class AgentSessionWrapper {
     this.chatOnly = options.chatOnly ?? false;
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
+    this.enableInlineSkillExpansion = options.enableInlineSkillExpansion ?? false;
     this.mcpHost = options.mcpHost;
     this.requestDiagnosticsDisposer = options.disposeRequestDiagnostics;
   }
@@ -616,6 +621,25 @@ export class AgentSessionWrapper {
     }
   }
 
+  private prepareInlineSkillMessage(message: string): string {
+    if (!this.enableInlineSkillExpansion || !this.inner.resourceLoader || !message.includes("$")) return message;
+    // Pi recognizes extension commands from the unexpanded first token. Keep
+    // their arguments byte-for-byte unchanged, including any `$skill` text.
+    if (message.startsWith("/")) {
+      const spaceIndex = message.indexOf(" ");
+      const commandName = spaceIndex === -1 ? message.slice(1) : message.slice(1, spaceIndex);
+      try {
+        if (this.inner.extensionRunner.getRegisteredCommands().some((command) => command.invocationName === commandName)) {
+          return message;
+        }
+      } catch {
+        // If command ownership cannot be established, preserve slash semantics.
+        return message;
+      }
+    }
+    return expandInlineSkillMentions(message, this.inner.resourceLoader.getSkills().skills);
+  }
+
   private async acquirePromptAdmission(): Promise<() => void> {
     const previous = this.promptAdmissionTail;
     let release!: () => void;
@@ -834,9 +858,22 @@ export class AgentSessionWrapper {
               if (this.mcpPromptWait === wait) this.mcpPromptWait = null;
             }
           }
+          let promptMessage: string;
+          try {
+            // The session catalog is sampled only after serialized admission and
+            // after classification of the original command above. A concurrent
+            // reload therefore cannot mix two resource catalogs in one send.
+            promptMessage = typeof command.message === "string"
+              ? this.prepareInlineSkillMessage(command.message)
+              : command.message as string;
+          } catch (error) {
+            finishPrompt();
+            throw error;
+          }
+
           let prompt: Promise<void>;
           try {
-            prompt = this.inner.prompt(command.message as string, {
+            prompt = this.inner.prompt(promptMessage, {
               ...(promptImages?.length ? { images: promptImages } : {}),
               ...(streamingBehavior ? { streamingBehavior } : {}),
               source: "rpc",
@@ -1126,15 +1163,31 @@ export class AgentSessionWrapper {
       }
 
       case "steer": {
-        const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.steer(command.message as string, steerImages?.length ? steerImages : undefined);
-        return null;
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
+          const message = typeof command.message === "string"
+            ? this.prepareInlineSkillMessage(command.message)
+            : command.message as string;
+          await this.inner.steer(message, steerImages?.length ? steerImages : undefined);
+          return null;
+        } finally {
+          releaseAdmission();
+        }
       }
 
       case "follow_up": {
-        const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.followUp(command.message as string, followImages?.length ? followImages : undefined);
-        return null;
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
+          const message = typeof command.message === "string"
+            ? this.prepareInlineSkillMessage(command.message)
+            : command.message as string;
+          await this.inner.followUp(message, followImages?.length ? followImages : undefined);
+          return null;
+        } finally {
+          releaseAdmission();
+        }
       }
 
       case "get_tools": {
@@ -1192,23 +1245,28 @@ export class AgentSessionWrapper {
       }
 
       case "reload": {
-        if (this.extensionUiAbortController.signal.aborted) {
-          this.extensionUiAbortController = new AbortController();
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          if (this.extensionUiAbortController.signal.aborted) {
+            this.extensionUiAbortController = new AbortController();
+          }
+          const activeToolNames = this.inner.getActiveToolNames();
+          await this.waitForExtensionsBound();
+          this.extensionStatuses.clear();
+          this.resetExtensionWidgetsForReload();
+          this.syncProjectTrust();
+          await this.inner.reload();
+          // pi rebuilds from the tools active before, then extensions adjust them as they start
+          // again; carry that result so a tool one switched off during reload stays off.
+          this.setActiveToolSelection(activeToolNames);
+          if (typeof this.inner.bindExtensions !== "function") {
+            this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
+          }
+          invalidateModelsCache();
+          return { success: true };
+        } finally {
+          releaseAdmission();
         }
-        const activeToolNames = this.inner.getActiveToolNames();
-        await this.waitForExtensionsBound();
-        this.extensionStatuses.clear();
-        this.resetExtensionWidgetsForReload();
-        this.syncProjectTrust();
-        await this.inner.reload();
-        // pi rebuilds from the tools active before, then extensions adjust them as they start
-        // again; carry that result so a tool one switched off during reload stays off.
-        this.setActiveToolSelection(activeToolNames);
-        if (typeof this.inner.bindExtensions !== "function") {
-          this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
-        }
-        invalidateModelsCache();
-        return { success: true };
       }
 
       case "abort_compaction": {
@@ -2544,6 +2602,7 @@ export async function startRpcSession(
         });
       },
       suppressCompletionNotifications: Boolean(subagentResources),
+      enableInlineSkillExpansion: !subagentResources,
       ...(builtins?.mcpHost ? { mcpHost: builtins.mcpHost } : {}),
     });
     const realSessionId = inner.sessionId as string;

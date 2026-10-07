@@ -1271,6 +1271,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 onSend={askSelectionInNewChat}
                 onAbort={closeQuotedSelection}
                 isStreaming={false}
+                slashCommands={slashCommands}
+                slashCommandsLoading={slashCommandsLoading}
+                onLoadSlashCommands={loadSlashCommands}
               />
               {quoteError && <div role="alert" style={{ color: "#dc2626", fontSize: 12, overflowWrap: "anywhere" }}>{quoteError}</div>}
             </fieldset>

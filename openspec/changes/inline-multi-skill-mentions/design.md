@@ -1,0 +1,34 @@
+## Context
+
+See proposal.md for motivation and specs/inline-skill-mentions/spec.md for the behavior contract. The installed official SDK 1.0.3 expands only the leading `/skill:name`. Pi Web already exposes loaded skills through command discovery and dispatches Web input through `AgentSessionWrapper.send` to the public SDK prompt/steer/followUp methods.
+
+Public Codex reference source (not the private APP frontend) collects multiple selected skill identities in `codex-rs/tui/src/chatwidget/input_submission.rs` and injects instruction fragments for selected entries in `codex-rs/ext/skills/src/extension.rs`. This supports the intended composition style; Pi Web need not adopt Codex's protocol.
+
+## Goals / Non-Goals
+
+**Goals:** Cursor-local completion, shared lexical rules, active-session resource authority and fail-closed loading across all Web input modes, with actual browser and installed-SDK consumer evidence.
+
+**Non-Goals:** A Core fork, parsing arbitrary `$path` files, changing subagent resource selection, executing skill scripts, redesigning slash discovery, publishing or deploying the change.
+
+## Decisions
+
+1. **One pure client-safe lexer.** Backend ownership of `lib/skill-mentions.ts` provides `scanSkillMentions(text)` returning `{name,start,end}[]` and `getActiveSkillMention(text,cursor)` returning `{query,start,end}|null`. Offsets use JavaScript string/caret indexing; completion end covers the full token and query covers only the prefix up to the caret. Empty `$` is eligible for completion but not expansion. Use SDK-compatible lowercase letters/digits/hyphens, maximum 64 characters, no leading/trailing/consecutive hyphens; exclude tokens with no letter to keep currency numeric. Numeric-leading names such as `3d-tools` remain supported. Skip escaped dollars, inline/fenced code, doubled dollars and embedded word/path/email tokens. Invalid full tokens must not resolve through a valid prefix.
+
+2. **Reuse existing command catalog in the composer.** Filter source=skill commands, normalize the `skill:` name prefix and reuse loaded descriptions. Resolve only the active caret span, preserve prefix/suffix and restore caret after completion. Keep slash/@ palettes and streaming queue behavior intact. A suggestion inserts text; it does not execute a command or submit. User-message presentation escapes only dollar references identified by loaded skill wrappers before Markdown rendering, so paired skill tokens do not become math. Raw input, copy/edit targets and unrelated math remain unchanged. A new-session lazy-load/reload must use the existing command loader rather than a global `/api/skills` scan.
+
+3. **Expand at the Web send boundary, not a throwing input handler.** `AgentSessionWrapper.send` resolves names from `inner.resourceLoader.getSkills().skills` immediately before calling `inner.prompt`, `inner.steer` or `inner.followUp`. The installed SDK catches input-handler errors and continues, so an extension-only throwing transform would not satisfy fail-closed loading. A Web adapter rejects before model execution while leaving public SDK input handlers and leading slash expansion intact. Gate this feature off for non-Web subagent wrappers. Keep classification/MCP preparation based on the original message. Registered extension slash-command arguments are not ordinary model input and must not be rewritten by dollar expansion; `/skill:name` remains the SDK's skill-input path.
+
+4. **Read all selected bodies safely before submitting anything.** Preserve the original request and append once-per-skill wrappers in first-appearance order. Strip frontmatter and retain the same registered location/base-directory semantics as the SDK slash expansion. Explicit-only skills remain eligible; unknown tokens remain literal. The catalog is sampled at send time, not cached globally, so resource reload/resume applies naturally. Only registered paths are read. Bound reads to regular UTF-8 files, 128 KiB per skill, 1 MiB aggregate and 16 distinct skills per message; reject errors/oversize visibly, never truncate silently. These are Web reference limits, not restrictions on normal slash loading or automatic skill use.
+
+## Risks / Trade-offs
+
+- Dollar syntax can conflict with shell/code examples → shared conservative lexer, exact catalog matching, unknown preservation and explicit code/escape fixtures.
+- Catalog names may collide → retain SDK loader's selected catalog entry; do not introduce independent path search or client-controlled identity.
+- Generated skill bodies can contain dollar tokens → scan only the original submitted message once, never recursively expand generated wrappers.
+- Preflight expansion precedes third-party SDK input transforms → preserve their public pipeline; do not promise that arbitrary user extensions retain input they intentionally handle/replace.
+- Active service HMR is not deployment qualification → use test-owned fixtures and faux providers; do not restart/build the active checkout or claim paid-model correctness.
+- Demo has a separate composer copy → mirror only the user-facing interaction if needed and check it separately; demo mocks do not prove server expansion.
+
+## Migration Plan
+
+Add the opt-in syntax without removing any slash/file command. Existing drafts remain text and references need no new stored schema. Record local acceptance and unresolved hosted/runtime limits; leave publication/runtime adoption to a separate user decision. Rollback removes Web lexer/completion/adapter wiring without changing persisted SDK formats or Core.

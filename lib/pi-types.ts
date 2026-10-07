@@ -71,6 +71,9 @@ interface PromptTemplateLike {
 interface SkillLike {
   name: string;
   description?: string;
+  filePath: string;
+  baseDir: string;
+  disableModelInvocation?: boolean;
   sourceInfo: SlashCommandInfo["sourceInfo"];
 }
 
